@@ -489,9 +489,10 @@ async def init_llm_worker(
         runtime_config.max_num_batched_tokens = engine_args["max_num_tokens"]
         runtime_config.reasoning_parser = config.dyn_reasoning_parser
         runtime_config.tool_call_parser = config.dyn_tool_call_parser
-        runtime_config.exclude_tools_when_tool_choice_none = (
-            config.exclude_tools_when_tool_choice_none
-        )
+        if hasattr(runtime_config, "exclude_tools_when_tool_choice_none"):
+            runtime_config.exclude_tools_when_tool_choice_none = getattr(
+                config, "exclude_tools_when_tool_choice_none", True
+            )
         # Decode workers don't create the WorkerKvQuery endpoint, so don't advertise local indexer
         runtime_config.enable_local_indexer = (
             config.enable_local_indexer
@@ -580,7 +581,7 @@ async def init_llm_worker(
         logging.debug("DYNAMO_COMPONENT_REGISTRY callback registered successfully")
 
         # publisher will be set later if publishing is enabled.
-        handler_config = RequestHandlerConfig(
+        handler_kwargs = dict(
             engine=engine,
             default_sampling_params=default_sampling_params,
             publisher=None,
@@ -589,7 +590,7 @@ async def init_llm_worker(
             multimodal_processor=multimodal_processor,
             generate_endpoint=endpoint,
             connector=connector,
-            runtime=runtime,  # Pass runtime for graceful shutdown
+            runtime=runtime,
             metrics_collector=metrics_collector,
             kv_block_size=config.kv_block_size,
             shutdown_event=shutdown_event,
@@ -598,6 +599,10 @@ async def init_llm_worker(
             max_seq_len=config.max_seq_len,
             disagg_machine_id=int(endpoint.connection_id()) % 1021,
         )
+        import inspect
+        valid_params = set(inspect.signature(RequestHandlerConfig.__init__).parameters.keys())
+        handler_kwargs = {k: v for k, v in handler_kwargs.items() if k in valid_params}
+        handler_config = RequestHandlerConfig(**handler_kwargs)
 
         media_decoder = None
         media_fetcher = None
