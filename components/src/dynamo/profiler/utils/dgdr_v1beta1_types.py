@@ -64,11 +64,20 @@ class DeviceType(str, Enum):
 
 class GPUSKUType(str, Enum):
     GB200SXM = "gb200_sxm"
+    B200SXM = "b200_sxm"
     H200SXM = "h200_sxm"
     H100SXM = "h100_sxm"
-    B200SXM = "b200_sxm"
+    H100PCIe = "h100_pcie"
     A100SXM = "a100_sxm"
+    A100PCIe = "a100_pcie"
     L40S = "l40s"
+    L40 = "l40"
+    L4 = "l4"
+    V100SXM = "v100_sxm"
+    V100PCIe = "v100_pcie"
+    T4 = "t4"
+    MI200 = "mi200"
+    MI300 = "mi300"
 
 
 class XPUSKUType(str, Enum):
@@ -227,6 +236,14 @@ class HardwareSpec(BaseModel):
     )
     numGpusPerNode: Optional[int] = Field(
         default=None, description="NumGPUsPerNode is the number of GPUs per node."
+    )
+    interconnect: Optional[str] = Field(
+        default=None,
+        description='Interconnect describes the GPU interconnect type within a node. Examples: "pcie", "nvlink", "infiniband".',
+    )
+    rdma: Optional[bool] = Field(
+        default=None,
+        description="RDMA indicates whether RDMA is available on the cluster.",
     )
 
     @model_validator(mode="after")
