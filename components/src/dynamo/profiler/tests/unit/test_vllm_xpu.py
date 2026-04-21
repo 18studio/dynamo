@@ -254,9 +254,7 @@ class TestSetDeviceTypeXpu:
 
         result_frontend = result["spec"]["services"]["Frontend"]
         # Frontend should not have env, resourceClaims, or _xpu modifications
-        fe_container = result_frontend.get("extraPodSpec", {}).get(
-            "mainContainer", {}
-        )
+        fe_container = result_frontend.get("extraPodSpec", {}).get("mainContainer", {})
         assert "env" not in fe_container or fe_container["env"] is None
 
     def test_xpu_string_accepted(self) -> None:
@@ -276,13 +274,13 @@ class TestSetDeviceTypeXpu:
             worker = result["spec"]["services"][worker_name]
             env = worker["extraPodSpec"]["mainContainer"]["env"]
             env_names = {e["name"]: e["value"] for e in env if isinstance(e, dict)}
-            assert env_names.get("VLLM_TARGET_DEVICE") == "xpu", (
-                f"{worker_name} missing VLLM_TARGET_DEVICE env"
-            )
+            assert (
+                env_names.get("VLLM_TARGET_DEVICE") == "xpu"
+            ), f"{worker_name} missing VLLM_TARGET_DEVICE env"
             pod_claims = worker["extraPodSpec"]["resourceClaims"]
-            assert any(rc.get("name") == "gpu" for rc in pod_claims), (
-                f"{worker_name} missing resourceClaim"
-            )
+            assert any(
+                rc.get("name") == "gpu" for rc in pod_claims
+            ), f"{worker_name} missing resourceClaim"
 
     def test_idempotent_double_call(self) -> None:
         """Calling set_device_type twice should not duplicate env vars or claims."""
@@ -294,9 +292,13 @@ class TestSetDeviceTypeXpu:
         worker = result2["spec"]["services"]["VllmDecodeWorker"]
         env = worker["extraPodSpec"]["mainContainer"]["env"]
         device_envs = [
-            e for e in env if isinstance(e, dict) and e.get("name") == "VLLM_TARGET_DEVICE"
+            e
+            for e in env
+            if isinstance(e, dict) and e.get("name") == "VLLM_TARGET_DEVICE"
         ]
-        assert len(device_envs) == 1, "VLLM_TARGET_DEVICE env var should not be duplicated"
+        assert (
+            len(device_envs) == 1
+        ), "VLLM_TARGET_DEVICE env var should not be duplicated"
 
         pod_claims = worker["extraPodSpec"]["resourceClaims"]
         gpu_claims = [rc for rc in pod_claims if rc.get("name") == "gpu"]
