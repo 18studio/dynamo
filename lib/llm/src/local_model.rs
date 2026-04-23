@@ -438,15 +438,23 @@ impl LocalModel {
     ///
     /// For base models, pass `lora_name = None`.
     /// For LoRA adapters, pass `lora_name = Some("adapter-name")`.
+    ///
+    /// `worker_type` / `needs` are the DGH-706 topology readiness fields. Pass
+    /// `WorkerType::empty()` for both when the caller does not yet set them
+    /// (handled by the missing-field compat contract on the reader side).
     pub async fn attach(
         &mut self,
         endpoint: &Endpoint,
         model_type: ModelType,
         model_input: ModelInput,
         lora_info: Option<crate::model_card::LoraInfo>,
+        worker_type: crate::worker_type::WorkerType,
+        needs: crate::worker_type::WorkerType,
     ) -> anyhow::Result<()> {
         self.card.model_type = model_type;
         self.card.model_input = model_input;
+        self.card.worker_type = worker_type;
+        self.card.needs = needs;
         self.card.lora = lora_info.clone();
 
         // Compute model_suffix from lora_name if present

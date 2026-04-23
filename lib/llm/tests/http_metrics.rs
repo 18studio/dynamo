@@ -412,6 +412,8 @@ mod integration_tests {
                 dynamo_llm::model_type::ModelType::Chat,
                 dynamo_llm::model_type::ModelInput::Text,
                 None,
+                dynamo_llm::worker_type::WorkerType::empty(),
+                dynamo_llm::worker_type::WorkerType::empty(),
             )
             .await
             .unwrap();

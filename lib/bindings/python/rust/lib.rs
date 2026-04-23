@@ -194,6 +194,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<context::Context>()?;
     m.add_class::<ModelType>()?;
     m.add_class::<ModelInput>()?;
+    m.add_class::<WorkerType>()?;
     m.add_class::<llm::kv::KvRouter>()?;
     m.add_class::<RouterMode>()?;
     m.add_class::<kserve_grpc::KserveGrpcService>()?;
@@ -263,7 +264,7 @@ fn lora_name_to_id(lora_name: &str) -> i32 {
 /// For LoRA mode, both `lora_name` and `base_model_path` must be provided together.
 /// Providing only one of them will result in an error.
 #[pyfunction]
-#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, context_length=None, kv_cache_block_size=None, router_mode=None, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None))]
+#[pyo3(signature = (model_input, model_type, endpoint, model_path, model_name=None, context_length=None, kv_cache_block_size=None, router_mode=None, runtime_config=None, user_data=None, custom_template_path=None, media_decoder=None, media_fetcher=None, lora_name=None, base_model_path=None, worker_type=None, needs=None))]
 #[allow(clippy::too_many_arguments)]
 fn register_model<'p>(
     py: Python<'p>,
@@ -282,6 +283,8 @@ fn register_model<'p>(
     media_fetcher: Option<MediaFetcher>,
     lora_name: Option<&str>,
     base_model_path: Option<&str>,
+    worker_type: Option<WorkerType>,
+    needs: Option<WorkerType>,
 ) -> PyResult<Bound<'p, PyAny>> {
     // Validate Prefill model type requirements
     if model_type.inner == llm_rs::model_type::ModelType::Prefill
@@ -303,6 +306,20 @@ fn register_model<'p>(
     let is_videos = model_type.inner.supports_videos();
 
     let model_type_obj = model_type.inner;
+    let worker_type_bits = worker_type
+        .map(|w| w.inner)
+        .unwrap_or_else(llm_rs::worker_type::WorkerType::empty);
+    let needs_bits = needs
+        .map(|n| n.inner)
+        .unwrap_or_else(llm_rs::worker_type::WorkerType::empty);
+
+    // Validate that worker_type, if non-empty, is one of the four canonical
+    // values. Readiness math (per DGH-706) depends on this invariant.
+    if !worker_type_bits.is_empty() && !worker_type_bits.is_canonical() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "worker_type must be one of Prefill/Decode/Encode/Aggregated; got {worker_type_bits}"
+        )));
+    }
 
     let inner_path = model_path.to_string();
     let model_name = model_name.map(|n| n.to_string());
@@ -356,6 +373,8 @@ fn register_model<'p>(
             let mut card = llm_rs::model_card::ModelDeploymentCard::with_name_only(&model_name);
             card.model_type = model_type_obj;
             card.model_input = model_input;
+            card.worker_type = worker_type_bits;
+            card.needs = needs_bits;
             card.user_data = user_data_json;
 
             if let Some(cfg) = runtime_config {
@@ -414,7 +433,14 @@ fn register_model<'p>(
             });
 
         local_model
-            .attach(&endpoint.inner, model_type_obj, model_input, lora_info)
+            .attach(
+                &endpoint.inner,
+                model_type_obj,
+                model_input,
+                lora_info,
+                worker_type_bits,
+                needs_bits,
+            )
             .await
             .map_err(to_pyerr)?;
 
@@ -581,6 +607,84 @@ enum ModelInput {
     Text = 1,
     Tokens = 2,
     Tensor = 3,
+}
+
+/// Processing stage this worker handles. See
+/// `docs/proposals/health-disagg-readiness.md` and the Rust `WorkerType`
+/// bitflag in `lib/llm/src/worker_type.rs`.
+///
+/// `Aggregated` is a bitflag alias for `Prefill | Decode` (not a separate
+/// bit). `WorkerType.Aggregated == WorkerType.Prefill | WorkerType.Decode`
+/// holds in Python too — `#[pyclass(eq)]` exposes the derived `PartialEq`
+/// as `__eq__`, so comparisons across different Python instances with the
+/// same underlying bits evaluate equal.
+#[pyclass(eq)]
+#[derive(Clone, PartialEq)]
+struct WorkerType {
+    inner: llm_rs::worker_type::WorkerType,
+}
+
+#[pymethods]
+#[allow(non_upper_case_globals)]
+impl WorkerType {
+    #[classattr]
+    const Prefill: Self = WorkerType {
+        inner: llm_rs::worker_type::WorkerType::Prefill,
+    };
+    #[classattr]
+    const Decode: Self = WorkerType {
+        inner: llm_rs::worker_type::WorkerType::Decode,
+    };
+    #[classattr]
+    const Encode: Self = WorkerType {
+        inner: llm_rs::worker_type::WorkerType::Encode,
+    };
+    #[classattr]
+    const Aggregated: Self = WorkerType {
+        inner: llm_rs::worker_type::WorkerType::Aggregated,
+    };
+
+    /// Construct the empty `WorkerType`. Use as the default for `needs` when
+    /// a worker has no peer dependencies.
+    #[staticmethod]
+    fn empty() -> Self {
+        WorkerType {
+            inner: llm_rs::worker_type::WorkerType::empty(),
+        }
+    }
+
+    fn contains_prefill(&self) -> bool {
+        self.inner.contains_prefill()
+    }
+    fn contains_decode(&self) -> bool {
+        self.inner.contains_decode()
+    }
+    fn contains_encode(&self) -> bool {
+        self.inner.contains_encode()
+    }
+    fn is_aggregated(&self) -> bool {
+        self.inner.is_aggregated()
+    }
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    fn is_canonical(&self) -> bool {
+        self.inner.is_canonical()
+    }
+
+    fn __or__(&self, other: &Self) -> Self {
+        WorkerType {
+            inner: self.inner | other.inner,
+        }
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("WorkerType({})", self.inner)
+    }
 }
 
 #[pymethods]

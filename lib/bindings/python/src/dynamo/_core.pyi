@@ -1458,6 +1458,8 @@ async def register_model(
     media_fetcher: Optional[MediaFetcher] = None,
     lora_name: Optional[str] = None,
     base_model_path: Optional[str] = None,
+    worker_type: Optional["WorkerType"] = None,
+    needs: Optional["WorkerType"] = None,
 ) -> None:
     """
     Attach the model at path to the given endpoint, and advertise it as model_type.
@@ -1470,8 +1472,42 @@ async def register_model(
     For TensorBased models (using ModelInput.Tensor), HuggingFace downloads are skipped
     and a minimal model card is registered directly. Use model_path as the display name
     for these models.
+
+    DGH-706 topology readiness:
+        `worker_type` / `needs` describe the worker's processing stage and peer
+        dependencies for the frontend's topology readiness check. When omitted,
+        the card carries `WorkerType.empty()` for both, and readers interpret
+        that as `Aggregated` with no needs (per the missing-field compatibility
+        contract). Backends that set these correctly enable per-model readiness
+        gating in the frontend.
     """
     ...
+
+class WorkerType:
+    """
+    Processing stage a worker handles (DGH-706 topology readiness).
+
+    Four canonical values. `Aggregated` is a bitflag alias for
+    `Prefill | Decode` — not a separate bit. See
+    `docs/proposals/health-disagg-readiness.md`.
+    """
+
+    Prefill: "WorkerType"
+    Decode: "WorkerType"
+    Encode: "WorkerType"
+    Aggregated: "WorkerType"
+
+    @staticmethod
+    def empty() -> "WorkerType": ...
+    def contains_prefill(self) -> bool: ...
+    def contains_decode(self) -> bool: ...
+    def contains_encode(self) -> bool: ...
+    def is_aggregated(self) -> bool: ...
+    def is_empty(self) -> bool: ...
+    def is_canonical(self) -> bool: ...
+    def __or__(self, other: "WorkerType") -> "WorkerType": ...
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
 
 async def unregister_model(
     endpoint: Endpoint,

@@ -45,7 +45,14 @@ pub async fn run(
                 Pin<Box<dyn AsyncEngineStream<Annotated<NvCreateChatCompletionStreamResponse>>>>,
             >::for_engine(engine)?;
             model
-                .attach(&endpoint, ModelType::Chat, ModelInput::Text, None)
+                .attach(
+                    &endpoint,
+                    ModelType::Chat,
+                    ModelInput::Text,
+                    None,
+                    crate::worker_type::WorkerType::empty(),
+                    crate::worker_type::WorkerType::empty(),
+                )
                 .await?;
             let fut_chat = endpoint.endpoint_builder().handler(ingress_chat).start();
 
@@ -76,7 +83,14 @@ pub async fn run(
                 ModelType::Chat | ModelType::Completions
             };
             model
-                .attach(&endpoint, model_type, ModelInput::Tokens, None)
+                .attach(
+                    &endpoint,
+                    model_type,
+                    ModelInput::Tokens,
+                    None,
+                    crate::worker_type::WorkerType::empty(),
+                    crate::worker_type::WorkerType::empty(),
+                )
                 .await?;
 
             let fut = endpoint.endpoint_builder().handler(ingress).start();

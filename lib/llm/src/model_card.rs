@@ -393,6 +393,14 @@ impl ModelDeploymentCard {
                 bytes_to_hash.extend(self.context_length.to_be_bytes());
                 bytes_to_hash.extend(self.kv_cache_block_size.to_be_bytes());
 
+                // Topology fields participate in the checksum so that a rolling
+                // update that changes only worker_type/needs is correctly
+                // rejected as incompatible with the existing WorkerSet (forcing
+                // drain-and-redeploy) instead of silently joining and serving
+                // stale readiness data.
+                bytes_to_hash.extend(self.worker_type.bits().to_be_bytes());
+                bytes_to_hash.extend(self.needs.bits().to_be_bytes());
+
                 // TODO: Do we want any of user_data or runtime_config?
 
                 blake3::hash(&bytes_to_hash).to_string()
@@ -1339,6 +1347,40 @@ mod worker_type_tests {
         assert_eq!(back.needs, WorkerType::Prefill | WorkerType::Decode);
         // And the E-PD satisfaction condition: needs satisfied by Aggregated alone.
         assert_eq!(back.needs & WorkerType::Aggregated, back.needs);
+    }
+
+    /// mdcsum must cover `worker_type` and `needs` so that a rolling update
+    /// which changes only topology metadata produces a different checksum,
+    /// triggering the drain-and-redeploy path in `watcher.rs` instead of
+    /// silently joining an existing WorkerSet with a stale card.
+    ///
+    /// Note: `mdcsum()` caches its result on first call via `OnceLock`, so
+    /// each case builds a fresh card rather than mutating one and re-hashing.
+    #[test]
+    fn mdcsum_covers_worker_type_and_needs() {
+        fn hash(worker_type: WorkerType, needs: WorkerType) -> String {
+            let mut card = ModelDeploymentCard::with_name_only("model");
+            card.worker_type = worker_type;
+            card.needs = needs;
+            card.mdcsum().to_string()
+        }
+
+        let empty = hash(WorkerType::empty(), WorkerType::empty());
+        let prefill = hash(WorkerType::Prefill, WorkerType::Decode);
+        let decode = hash(WorkerType::Decode, WorkerType::Prefill);
+
+        assert_ne!(
+            empty, prefill,
+            "non-empty worker_type must change mdcsum relative to empty"
+        );
+        assert_ne!(prefill, decode, "swapping worker_type must change mdcsum");
+
+        // Changing only `needs` must also change the hash.
+        let prefill_needs_encode = hash(WorkerType::Prefill, WorkerType::Encode);
+        assert_ne!(
+            prefill, prefill_needs_encode,
+            "changing only `needs` must change mdcsum"
+        );
     }
 
     /// Serde back-compat: an old-format card (no `worker_type` / `needs`
