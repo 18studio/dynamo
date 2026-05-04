@@ -569,7 +569,10 @@ class BaseConfigModifier:
         if pvc_name and pvc_mount_path:
             # Derive pvc_path from effective_model_path by stripping the mount prefix
             pvc_path = ""
-            if effective_model_path and effective_model_path.startswith(pvc_mount_path):
+            if effective_model_path and (
+                effective_model_path == pvc_mount_path
+                or effective_model_path.startswith(pvc_mount_path + "/")
+            ):
                 pvc_path = effective_model_path[len(pvc_mount_path) :].strip("/")
             if pvc_path:
                 # Model path points inside the PVC — use the full PVC-based path
@@ -586,7 +589,7 @@ class BaseConfigModifier:
                 cfg_dict = cfg.model_dump()
                 cfg2 = Config.model_validate(cfg_dict)
                 cls._ensure_spec_pvc(cfg2, pvc_name)
-                for svc_name, svc in cfg2.spec.services.items():
+                for svc in cfg2.spec.services.values():
                     cls._ensure_service_volume_mount(svc, pvc_name, pvc_mount_path)
                     cls._ensure_service_hf_home_env(svc, pvc_mount_path)
                 result = cls.update_model(
