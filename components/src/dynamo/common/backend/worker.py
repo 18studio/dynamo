@@ -220,9 +220,12 @@ class Worker:
 
         try:
             engine_config = await self._start_engine()
+            await self.engine.start_kv_events(endpoint, engine_config)
         except DynamoException:
+            await self._cleanup_once()
             raise
         except Exception as exc:
+            await self._cleanup_once()
             raise EngineShutdown(f"Engine initialization failed: {exc}") from exc
 
         try:
