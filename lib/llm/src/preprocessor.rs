@@ -1286,16 +1286,27 @@ impl OpenAIPreprocessor {
         // decode the parsers silently produce empty reasoning_content /
         // tool_calls.
         //
-        // - gemma4: `<|think|>` markers (reasoning + tool-call).
+        // - gemma4: `<|channel>` / `<channel|>` markers (reasoning + tool-call).
         // - harmony / gpt_oss: `<|channel|>analysis<|message|>...<|end|>`.
         // - kimi_k2: `<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>`.
         // - kimi_k25: `</think>` (special token id 163607).
+        // - mistral (reasoning): `[THINK]` / `[/THINK]` (special on Magistral
+        //   and Mistral-Small-3.x).
+        // - mistral (tool-call): `[TOOL_CALLS]` (special on Mistral-7B-v0.3
+        //   id 5; Mistral-Small-3.1 id 9).
+        // - llama3_json: `<|python_tag|>` (Llama-3 id 128010, in the reserved
+        //   special-token range).
         matches!(
             tool_call_parser,
-            Some("gemma4") | Some("gemma-4") | Some("harmony") | Some("kimi_k2")
+            Some("gemma4")
+                | Some("gemma-4")
+                | Some("harmony")
+                | Some("kimi_k2")
+                | Some("mistral")
+                | Some("llama3_json")
         ) || matches!(
             reasoning_parser,
-            Some("gemma4") | Some("gemma-4") | Some("gpt_oss") | Some("kimi_k25")
+            Some("gemma4") | Some("gemma-4") | Some("gpt_oss") | Some("kimi_k25") | Some("mistral")
         )
     }
 
@@ -1914,6 +1925,36 @@ mod tests {
                 true,
                 "kimi_k2 tool-call only → required \
                  (`<|tool_calls_section_begin|>` / `<|tool_calls_section_end|>` are special)",
+            ),
+            (
+                Some("mistral"),
+                None,
+                true,
+                "mistral tool-call only → required \
+                 (`[TOOL_CALLS]` is special on Mistral-7B-v0.3 id 5, \
+                  Mistral-Small-3.1 id 9)",
+            ),
+            (
+                None,
+                Some("mistral"),
+                true,
+                "mistral reasoning only → required \
+                 (`[THINK]` / `[/THINK]` are special on Magistral and \
+                  Mistral-Small-3.x; SGLang allow-lists this same case)",
+            ),
+            (
+                Some("mistral"),
+                Some("mistral"),
+                true,
+                "mistral paired → required",
+            ),
+            (
+                Some("llama3_json"),
+                None,
+                true,
+                "llama3_json tool-call only → required \
+                 (`<|python_tag|>` is Llama-3 id 128010 in the \
+                  reserved special-token range)",
             ),
             (None, None, false, "no parsers → not required"),
         ];
