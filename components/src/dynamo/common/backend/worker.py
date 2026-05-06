@@ -170,6 +170,8 @@ class Worker:
             except Exception:
                 logger.debug("Error during request abort", exc_info=True)
 
+        _normalize_disaggregated_state(request)
+
         cancel_task = asyncio.create_task(_monitor_cancel())
         try:
             async for chunk in self.engine.generate(request, context):
@@ -228,7 +230,13 @@ class Worker:
         try:
             runtime_config = _model_runtime_config(engine_config, cfg)
 
-            model_type = parse_endpoint_types(cfg.endpoint_types)
+            # Engines may override the registered model type (e.g. a prefill
+            # worker reports ModelType.Prefill so Dynamo's discovery promotes
+            # it to the prefill router instead of serving chat/completions).
+            if engine_config.model_type is not None:
+                model_type = engine_config.model_type
+            else:
+                model_type = parse_endpoint_types(cfg.endpoint_types)
 
             served_name = cfg.served_model_name or cfg.model_name
 
@@ -261,6 +269,30 @@ class Worker:
             await self._cleanup_once()
 
 
+def _normalize_disaggregated_state(request: GenerateRequest) -> None:
+    """Map legacy wire keys onto ``disaggregated_state`` in-place.
+
+    The Rust ``PrefillRouter`` writes ``bootstrap_info`` (router-resolved
+    bootstrap mode, used by SGLang and TokenSpeed) or ``prefill_result``
+    (synchronous fallback, used by vLLM and TRT-LLM) into the request before
+    routing it to the decode worker. The unified ``LLMEngine`` abstraction
+    exposes a single canonical ``disaggregated_state`` field; this adapter
+    lets engines read one name regardless of router flavor. Legacy keys are
+    preserved so existing handlers continue to work.
+    """
+    if request.get("disaggregated_state"):
+        return
+    bootstrap_info = request.get("bootstrap_info")  # type: ignore[typeddict-item]
+    if isinstance(bootstrap_info, dict) and bootstrap_info:
+        request["disaggregated_state"] = bootstrap_info
+        return
+    prefill_result = request.get("prefill_result")  # type: ignore[typeddict-item]
+    if isinstance(prefill_result, dict):
+        params = prefill_result.get("disaggregated_params")
+        if isinstance(params, dict) and params:
+            request["disaggregated_state"] = params
+
+
 def _model_runtime_config(
     engine_config: EngineConfig, worker_config: WorkerConfig
 ) -> ModelRuntimeConfig:
@@ -276,5 +308,11 @@ def _model_runtime_config(
     runtime_config.exclude_tools_when_tool_choice_none = (
         worker_config.exclude_tools_when_tool_choice_none
     )
-    runtime_config.enable_local_indexer = worker_config.enable_local_indexer
+    if engine_config.enable_local_indexer is not None:
+        runtime_config.enable_local_indexer = engine_config.enable_local_indexer
+    else:
+        runtime_config.enable_local_indexer = worker_config.enable_local_indexer
+    if engine_config.disaggregated_endpoint is not None:
+        host, port = engine_config.disaggregated_endpoint
+        runtime_config.set_disaggregated_endpoint(host, port)
     return runtime_config
