@@ -90,12 +90,14 @@ async def parse_omni_request(
     # OpenAI API server applies the template before the engine sees it;
     # without it the thinker receives bare text instead of the full
     # chat-formatted prompt.
+    prompt_token_ids: list[int] | None = None
     if messages and tokenizer_getter is not None:
         try:
             tokenizer = await tokenizer_getter()
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+            prompt_token_ids = _tokenize_chat_template(tokenizer, messages, text)
         except Exception:
             logging.getLogger(__name__).debug(
                 "Chat template not available, using raw text"
@@ -110,14 +112,55 @@ async def parse_omni_request(
         if request.get(key) is not None:
             sampling_overrides[key] = request[key]
 
+    original_prompt: dict[str, Any] = {"prompt": text}
+    if prompt_token_ids:
+        original_prompt["prompt_token_ids"] = prompt_token_ids
+
     return {
         "engine_inputs": text,
-        "original_prompt": {"prompt": text},
+        "original_prompt": original_prompt,
         "sampling_params_list": sampling_overrides or None,
         # vLLM-Omni applies OpenAI chat overrides to the comprehension stage
         # only. Talker/code2wav stages should keep their YAML defaults.
         "propagate_sampling_params": False,
     }
+
+
+def _tokenize_chat_template(
+    tokenizer: Any, messages: list, text: str
+) -> list[int] | None:
+    """Return chat-template token IDs for downstream Qwen talker processors."""
+    token_ids = None
+    try:
+        token_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True
+        )
+    except Exception:
+        encode = getattr(tokenizer, "encode", None)
+        if callable(encode):
+            try:
+                token_ids = encode(text, add_special_tokens=False)
+            except TypeError:
+                token_ids = encode(text)
+    return _normalize_token_ids(token_ids)
+
+
+def _normalize_token_ids(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, dict):
+        value = value.get("input_ids")
+    if hasattr(value, "data") and not isinstance(value, (list, tuple)):
+        value = getattr(value, "data")
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if value and isinstance(value, (list, tuple)) and isinstance(value[0], list):
+        value = value[0]
+    if not isinstance(value, (list, tuple)):
+        return None
+    return [int(token_id) for token_id in value]
 
 
 def _build_sampling_params(stage_config: Any, overrides: dict | None) -> list | None:

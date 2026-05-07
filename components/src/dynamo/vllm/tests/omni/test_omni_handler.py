@@ -321,6 +321,38 @@ class TestParseOmniRequest:
         }
         assert result["propagate_sampling_params"] is False
 
+    @pytest.mark.asyncio
+    async def test_chat_original_prompt_keeps_template_token_ids(self):
+        class Tokenizer:
+            def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+                assert add_generation_prompt is True
+                assert messages == [{"role": "user", "content": "hello"}]
+                if tokenize:
+                    return [151644, 872, 198, 9906, 151645, 151644, 77091]
+                return "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+
+        async def get_tokenizer():
+            return Tokenizer()
+
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+
+        result = await parse_omni_request(
+            request,
+            ["text", "audio"],
+            tokenizer_getter=get_tokenizer,
+        )
+
+        assert result["engine_inputs"].startswith("<|im_start|>user")
+        assert result["original_prompt"]["prompt_token_ids"] == [
+            151644,
+            872,
+            198,
+            9906,
+            151645,
+            151644,
+            77091,
+        ]
+
 
 # ---------------------------------------------------------------------------
 # AudioGenerationHandler — data_source / response_format field mapping
