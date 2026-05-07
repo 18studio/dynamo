@@ -306,6 +306,21 @@ class TestParseOmniRequest:
         assert "num_inference_steps" not in op
         assert "guidance_scale" not in op
 
+    @pytest.mark.asyncio
+    async def test_chat_sampling_overrides_stay_on_comprehension_stage(self):
+        request = {
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 32,
+            "temperature": 0.2,
+        }
+        result = await parse_omni_request(request, ["text", "audio"])
+
+        assert result["sampling_params_list"] == {
+            "max_tokens": 32,
+            "temperature": 0.2,
+        }
+        assert result["propagate_sampling_params"] is False
+
 
 # ---------------------------------------------------------------------------
 # AudioGenerationHandler — data_source / response_format field mapping

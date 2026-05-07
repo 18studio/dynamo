@@ -100,6 +100,7 @@ class OmniStageWorker:
 
         # --- Resolve engine inputs ---
         sampling_params_list_override: dict | None = None
+        propagate_sampling_params = True
         if stage_connector_refs:
             # Stage N > 0: fetch previous stage outputs from connectors, run pre-processor.
             sampling_params_list_override = req.sampling_params_list
@@ -169,6 +170,7 @@ class OmniStageWorker:
             prompt = parsed["engine_inputs"]
             original_prompt = parsed["original_prompt"]
             sampling_params_list_override = parsed["sampling_params_list"]
+            propagate_sampling_params = parsed.get("propagate_sampling_params", True)
         else:
             # Direct frontend → stage (single-stage, no router).
             prompt = request
@@ -261,7 +263,7 @@ class OmniStageWorker:
                     serialize_obj(last_result),
                     name=f"{request_id}-stage-{self.stage_id}",
                 )
-            if sampling_params_list_override is not None:
+            if sampling_params_list_override is not None and propagate_sampling_params:
                 out["sampling_params_list"] = sampling_params_list_override
             yield out
             return

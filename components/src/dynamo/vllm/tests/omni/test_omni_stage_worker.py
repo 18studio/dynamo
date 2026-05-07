@@ -623,6 +623,40 @@ async def test_image_request_with_default_sampling_params():
 
 
 @pytest.mark.asyncio
+async def test_chat_sampling_params_do_not_propagate_to_downstream_stages():
+    engine = _MockEngine()
+    out_connector = MagicMock()
+    out_connector.put.return_value = (True, 0, {"name": "ref1"})
+    worker = OmniStageWorker(
+        engine=engine,
+        stage_config=_make_stage_config(
+            default_sampling_params={
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "max_tokens": 2048,
+            },
+        ),
+        connectors={("0", "1"): out_connector},
+        stage_id=0,
+        output_modalities=["text", "audio"],
+    )
+    request = {
+        "request_id": "chat-req-1",
+        "messages": [{"role": "user", "content": "Say hi."}],
+        "modalities": ["text", "audio"],
+        "max_completion_tokens": 32,
+        "temperature": 0.2,
+    }
+
+    chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
+
+    assert not any("error" in c for c in chunks)
+    assert engine.received_sampling_params_list[0].max_tokens == 32
+    assert engine.received_sampling_params_list[0].temperature == 0.2
+    assert "sampling_params_list" not in chunks[0]
+
+
+@pytest.mark.asyncio
 async def test_sampling_params_propagate_in_stage_output():
     """Non-final stage must include sampling_params_list in its output for downstream stages."""
     engine = _MockEngine()

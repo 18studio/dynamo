@@ -43,7 +43,7 @@ async def parse_omni_request(
     default_video_fps: int = 16,
     tokenizer_getter=None,
 ) -> dict:
-    """Parse a raw frontend request into engine_inputs, original_prompt, sampling_params_list.
+    """Parse a raw frontend request into engine_inputs, original_prompt, sampling params.
 
     Args:
       tokenizer_getter: async callable returning a tokenizer (e.g. engine.get_tokenizer).
@@ -53,7 +53,9 @@ async def parse_omni_request(
     Returns:
       engine_inputs:        text prompt (str or OmniTextPrompt) for the stage 0 engine
       original_prompt:      rich prompt dict with geometry/params for processor functions
-      sampling_params_list: raw user overrides dict (height/width/nvext) or None for chat
+      sampling_params_list: raw user overrides for this stage, if any.
+      propagate_sampling_params: whether those overrides should be forwarded
+          to downstream stages.
     """
     _, request_type = parse_request_type(request, output_modalities)
 
@@ -74,6 +76,7 @@ async def parse_omni_request(
             "engine_inputs": OmniTextPrompt(prompt=request.get("prompt", "")),
             "original_prompt": build_original_prompt(request, nvext, height, width),
             "sampling_params_list": sp,
+            "propagate_sampling_params": True,
         }
 
     # Chat / text
@@ -111,6 +114,9 @@ async def parse_omni_request(
         "engine_inputs": text,
         "original_prompt": {"prompt": text},
         "sampling_params_list": sampling_overrides or None,
+        # vLLM-Omni applies OpenAI chat overrides to the comprehension stage
+        # only. Talker/code2wav stages should keep their YAML defaults.
+        "propagate_sampling_params": False,
     }
 
 
