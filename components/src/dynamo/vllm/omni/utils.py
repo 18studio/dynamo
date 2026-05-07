@@ -92,6 +92,7 @@ async def parse_omni_request(
     # chat-formatted prompt.
     prompt_token_ids: list[int] | None = None
     if messages and tokenizer_getter is not None:
+        tokenizer = None
         try:
             tokenizer = await tokenizer_getter()
             text = tokenizer.apply_chat_template(
@@ -99,9 +100,15 @@ async def parse_omni_request(
             )
             prompt_token_ids = _tokenize_chat_template(tokenizer, messages, text)
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Chat template not available, using raw text"
-            )
+            if tokenizer is not None and _is_qwen_chatml_tokenizer(tokenizer):
+                text = _render_qwen_chatml(messages)
+                prompt_token_ids = _normalize_token_ids(
+                    tokenizer.encode(text, add_special_tokens=False)
+                )
+            else:
+                logging.getLogger(__name__).debug(
+                    "Chat template not available, using raw text"
+                )
 
     sampling_overrides: dict[str, Any] = {}
     if request.get("max_completion_tokens") is not None:
@@ -143,6 +150,42 @@ def _tokenize_chat_template(
             except TypeError:
                 token_ids = encode(text)
     return _normalize_token_ids(token_ids)
+
+
+def _is_qwen_chatml_tokenizer(tokenizer: Any) -> bool:
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(convert):
+        return False
+    try:
+        return convert("<|im_start|>") == 151644 and convert("<|im_end|>") == 151645
+    except Exception:
+        return False
+
+
+def _render_qwen_chatml(messages: list) -> str:
+    rendered = []
+    for message in messages:
+        role = message.get("role", "user")
+        content = _message_content_text(message.get("content", ""))
+        rendered.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    rendered.append("<|im_start|>assistant\n")
+    return "".join(rendered)
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                value = item.get("text")
+                if value is not None:
+                    parts.append(str(value))
+            elif item is not None:
+                parts.append(str(item))
+        return "".join(parts)
+    return "" if content is None else str(content)
 
 
 def _normalize_token_ids(value: Any) -> list[int] | None:

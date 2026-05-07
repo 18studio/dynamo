@@ -353,6 +353,46 @@ class TestParseOmniRequest:
             77091,
         ]
 
+    @pytest.mark.asyncio
+    async def test_chat_original_prompt_uses_qwen_chatml_when_template_missing(self):
+        class Tokenizer:
+            def apply_chat_template(self, *_args, **_kwargs):
+                raise ValueError("chat_template is not set")
+
+            def convert_tokens_to_ids(self, token):
+                return {"<|im_start|>": 151644, "<|im_end|>": 151645}.get(token)
+
+            def encode(self, text, *, add_special_tokens):
+                assert add_special_tokens is False
+                assert text == (
+                    "<|im_start|>user\nhello<|im_end|>\n" "<|im_start|>assistant\n"
+                )
+                return [151644, 872, 198, 9906, 151645, 198, 151644, 77091, 198]
+
+        async def get_tokenizer():
+            return Tokenizer()
+
+        request = {"messages": [{"role": "user", "content": "hello"}]}
+
+        result = await parse_omni_request(
+            request,
+            ["text", "audio"],
+            tokenizer_getter=get_tokenizer,
+        )
+
+        assert result["engine_inputs"].startswith("<|im_start|>user")
+        assert result["original_prompt"]["prompt_token_ids"] == [
+            151644,
+            872,
+            198,
+            9906,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ]
+
 
 # ---------------------------------------------------------------------------
 # AudioGenerationHandler — data_source / response_format field mapping
