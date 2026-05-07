@@ -82,12 +82,15 @@ def _patched_generate(router, request, request_id="req-1", request_type="chat"):
 @pytest.mark.asyncio
 async def test_generate_passes_stage_connector_refs_opaquely():
     """Router must pass stage_connector_refs from stage output to next stage unchanged."""
+    stage0_received = {}
     stage1_received = {}
 
     async def stage0_handler(request):
+        stage0_received.update(request)
         return {
             "original_prompt": {"prompt": "hi"},
             "stage_connector_refs": {"0": {"shm_name": "abc", "size": 42}},
+            "final_stage_id": request["final_stage_id"],
             "finished": True,
         }
 
@@ -119,6 +122,8 @@ async def test_generate_passes_stage_connector_refs_opaquely():
     }
     assert stage1_received["original_prompt"] == {"prompt": "hi"}
     assert stage1_received["request_id"] == "req-1"
+    assert stage0_received["final_stage_id"] == 1
+    assert stage1_received["final_stage_id"] == 1
     # 'finished' must be stripped — it is a router signal, not a stage protocol field.
     assert "finished" not in stage1_received
 

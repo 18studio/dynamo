@@ -18,6 +18,7 @@ from vllm_omni.distributed.omni_connectors import (
     initialize_orchestrator_connectors,
 )
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_omni_engine import _apply_omni_final_stage_metadata
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.stage_utils import serialize_obj, shm_write_bytes
@@ -93,6 +94,7 @@ class OmniStageWorker:
         req = StageRequest.model_validate(request)
         request_id = req.request_id or context.id()
         original_prompt = req.original_prompt
+        final_stage_id = req.final_stage_id
         # JSON sends dict keys as strings; normalize to int for stage_connector_refs.
         stage_connector_refs = _int_keyed(req.stage_connector_refs)
 
@@ -146,7 +148,10 @@ class OmniStageWorker:
                 if hasattr(upstream, "outputs") and upstream.outputs:
                     try:
                         prompt = self._build_engine_core_request_from_upstream(
-                            stage_list, request_id, sampling_params_list_override
+                            stage_list,
+                            request_id,
+                            sampling_params_list_override,
+                            final_stage_id,
                         )
                     except RuntimeError as e:
                         yield {"error": str(e), "finished": True}
@@ -179,11 +184,15 @@ class OmniStageWorker:
         if stage_connector_refs:
             try:
                 prompt = self._build_engine_core_request_from_stage_prompt(
-                    prompt, request_id, sp
+                    prompt, request_id, sp, final_stage_id
                 )
             except RuntimeError as e:
                 yield {"error": str(e), "finished": True}
                 return
+        else:
+            prompt = self._prepare_initial_stage_prompt(
+                prompt, request_id, sp, final_stage_id
+            )
         last_result = None
         interstage_result = None
 
@@ -245,6 +254,8 @@ class OmniStageWorker:
                 },
                 "finished": True,
             }
+            if final_stage_id is not None:
+                out["final_stage_id"] = final_stage_id
             if getattr(self.stage_config, "final_output", False):
                 out["shm_meta"] = shm_write_bytes(
                     serialize_obj(last_result),
@@ -270,6 +281,7 @@ class OmniStageWorker:
         stage_list: list[_Proxy],
         request_id: str,
         sampling_params_list_override: dict | None,
+        final_stage_id: int | None,
     ):
         """Build an OmniEngineCoreRequest from the upstream stage output.
 
@@ -300,6 +312,7 @@ class OmniStageWorker:
             tokens_prompt,
             request_id,
             _build_sampling_params(self.stage_config, sampling_params_list_override),
+            final_stage_id,
         )
 
     def _build_engine_core_request_from_stage_prompt(
@@ -307,10 +320,11 @@ class OmniStageWorker:
         prompt: Any,
         request_id: str,
         sampling_params_list: list | None,
+        final_stage_id: int | None = None,
     ) -> Any:
         """Wrap downstream token prompts the same way vLLM-Omni's orchestrator does."""
         if isinstance(prompt, OmniEngineCoreRequest):
-            return prompt
+            return self._apply_final_stage_metadata(prompt, final_stage_id)
         has_token_ids = hasattr(prompt, "prompt_token_ids") or (
             isinstance(prompt, dict) and "prompt_token_ids" in prompt
         )
@@ -335,7 +349,51 @@ class OmniStageWorker:
             request_index=0,
             queue=None,
         )
-        return prompt
+        return self._apply_final_stage_metadata(prompt, final_stage_id)
+
+    def _prepare_initial_stage_prompt(
+        self,
+        prompt: Any,
+        request_id: str,
+        sampling_params_list: list | None,
+        final_stage_id: int | None,
+    ) -> Any:
+        """Pre-tokenize stage-0 prompts when downstream stages need sidecars.
+
+        Dynamo embeds each vLLM-Omni stage in its own single-stage AsyncOmni.
+        The embedded orchestrator must still finish locally at stage 0, but the
+        EngineCoreRequest needs the global final stage metadata so vLLM-Omni
+        emits multimodal payloads for downstream Dynamo stages.
+        """
+        if final_stage_id is None or final_stage_id <= self.stage_id:
+            return prompt
+        if isinstance(prompt, OmniEngineCoreRequest):
+            return self._apply_final_stage_metadata(prompt, final_stage_id)
+
+        engine_core = getattr(self.engine, "engine", None)
+        build_message = getattr(engine_core, "_build_add_request_message", None)
+        if build_message is None:
+            logger.warning(
+                "Stage %d: cannot prebuild EngineCoreRequest with final_stage_id=%s",
+                self.stage_id,
+                final_stage_id,
+            )
+            return prompt
+
+        msg = build_message(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+        )
+        return msg.get("prompt", prompt)
+
+    def _apply_final_stage_metadata(
+        self, prompt: Any, final_stage_id: int | None
+    ) -> Any:
+        if final_stage_id is None or final_stage_id <= self.stage_id:
+            return prompt
+        return _apply_omni_final_stage_metadata(prompt, final_stage_id)
 
     def _fetch_stage_inputs(
         self,

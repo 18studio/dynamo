@@ -87,7 +87,11 @@ class OmniStageRouter:
 
             if stage_idx == 0:
                 # This is a workaround for now to pass in the raw request to stage 0. StageRequest validates it but ignores any unknown keys, so it gets passed through.
-                stage_request = {"request_id": request_id, **request}
+                stage_request = {
+                    "request_id": request_id,
+                    "final_stage_id": last_stage_idx,
+                    **request,
+                }
             else:
                 stage_request = stage_outputs[-1].to_next_stage_request(request_id)
 

@@ -98,10 +98,19 @@ async def parse_omni_request(
                 "Chat template not available, using raw text"
             )
 
+    sampling_overrides: dict[str, Any] = {}
+    if request.get("max_completion_tokens") is not None:
+        sampling_overrides["max_tokens"] = request["max_completion_tokens"]
+    if request.get("max_tokens") is not None:
+        sampling_overrides["max_tokens"] = request["max_tokens"]
+    for key in ("temperature", "top_p", "top_k", "min_p", "stop", "seed"):
+        if request.get(key) is not None:
+            sampling_overrides[key] = request[key]
+
     return {
         "engine_inputs": text,
         "original_prompt": {"prompt": text},
-        "sampling_params_list": None,
+        "sampling_params_list": sampling_overrides or None,
     }
 
 

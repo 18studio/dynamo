@@ -230,6 +230,7 @@ async def test_stage_connector_refs_input_path():
     assert chunks[0]["stage_connector_refs"]["1"] == {"name": "ref1", "size": 10}
     assert chunks[0]["stage_connector_refs"]["0"] == {"name": "ref0", "size": 5}
     assert chunks[0]["original_prompt"] == {"prompt": "hello"}
+    assert "final_stage_id" not in chunks[0]
 
 
 @pytest.mark.asyncio
@@ -274,6 +275,44 @@ async def test_stage_connector_refs_builds_engine_core_request():
     assert engine.received_prompt.prompt_token_ids == [100, 200, 300]
     # Output processor should have been registered
     engine.engine.output_processors[0].add_request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stage_connector_refs_tags_engine_core_request_with_final_stage_id():
+    engine = _MockEngine()
+    engine.engine = MagicMock()
+    mock_output = SimpleNamespace(
+        outputs=[SimpleNamespace(token_ids=[100, 200, 300])],
+        prompt_token_ids=[1, 2],
+    )
+    in_connector = MagicMock()
+    in_connector.get.return_value = mock_output
+    tagged_prompt = object()
+
+    worker = _make_worker(
+        engine=engine,
+        connectors={("0", "1"): in_connector},
+        stage_id=1,
+        stage_config=_make_stage_config(
+            default_sampling_params={"temperature": 0.9, "max_tokens": 100},
+        ),
+    )
+    request = {
+        "request_id": "req-ecr-final",
+        "original_prompt": {"prompt": "hello"},
+        "stage_connector_refs": {"0": {"name": "ref0"}},
+        "final_stage_id": 2,
+    }
+
+    with patch(
+        "dynamo.vllm.omni.stage_worker._apply_omni_final_stage_metadata",
+        return_value=tagged_prompt,
+    ) as apply_final_stage:
+        _ = [chunk async for chunk in worker.generate(request, _MockContext())]
+
+    assert engine.received_prompt is tagged_prompt
+    apply_final_stage.assert_called_once()
+    assert apply_final_stage.call_args.args[1] == 2
 
 
 @pytest.mark.asyncio
@@ -336,6 +375,37 @@ async def test_stage_connector_refs_with_processor():
     assert processor_calls[0]["streaming_context"] is None
     assert engine.received_prompt == processed_prompt
     assert chunks[0]["stage_connector_refs"]["1"] == {"name": "ref1"}
+
+
+@pytest.mark.asyncio
+async def test_stage0_prebuilds_prompt_with_global_final_stage_id():
+    engine = _MockEngine()
+    prebuilt_prompt = object()
+    engine.engine = MagicMock()
+    engine.engine._build_add_request_message.return_value = {"prompt": prebuilt_prompt}
+
+    worker = _make_worker(
+        engine=engine,
+        stage_id=0,
+        stage_config=_make_stage_config(
+            default_sampling_params={"temperature": 0.7, "max_tokens": 16},
+        ),
+    )
+    worker._output_modalities = ["text", "audio"]
+    request = {
+        "request_id": "req-prebuild",
+        "messages": [{"role": "user", "content": "hello"}],
+        "modalities": ["text", "audio"],
+        "final_stage_id": 2,
+    }
+
+    _ = [chunk async for chunk in worker.generate(request, _MockContext())]
+
+    assert engine.received_prompt is prebuilt_prompt
+    engine.engine._build_add_request_message.assert_called_once()
+    assert (
+        engine.engine._build_add_request_message.call_args.kwargs["final_stage_id"] == 2
+    )
 
 
 @pytest.mark.asyncio
@@ -577,6 +647,7 @@ async def test_sampling_params_propagate_in_stage_output():
             "height": 480,
             "width": 832,
         },
+        "final_stage_id": 2,
     }
 
     with patch(
@@ -590,3 +661,4 @@ async def test_sampling_params_propagate_in_stage_output():
         "height": 480,
         "width": 832,
     }
+    assert chunks[0].get("final_stage_id") == 2
