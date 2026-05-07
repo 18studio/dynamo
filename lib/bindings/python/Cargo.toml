@@ -22,12 +22,16 @@ name = "_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["lightseek-mm"]
 media-ffmpeg = ["dynamo-llm/media-ffmpeg"]
 kv-indexer = ["dep:clap", "dep:tracing-subscriber"]
 kv-indexer-metrics = ["kv-indexer", "dynamo-kv-router/metrics"]
 mocker-kvbm-offload = ["dynamo-mocker/kvbm-offload"]
 nvtx = ["dynamo-runtime/nvtx"]
+# Enable in-process MM-aware KV routing via the lightseek crate
+# (per-image token-count + placeholder expansion + block-level mm_hash).
+# Default-on; opt out with `--no-default-features` for a slimmer wheel.
+lightseek-mm = ["dynamo-llm/lightseek-mm"]
 
 [dependencies]
 dynamo-runtime = { path = "../../runtime" }
