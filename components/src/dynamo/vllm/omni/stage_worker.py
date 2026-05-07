@@ -36,6 +36,8 @@ from dynamo.vllm.omni.utils import _build_sampling_params, parse_omni_request
 
 logger = logging.getLogger(__name__)
 
+_QWEN_CHAT_IM_START_TOKEN_ID = 151644
+
 
 @dataclass
 class _Proxy:
@@ -46,9 +48,18 @@ class _Proxy:
 
     def __getattr__(self, name: str) -> Any:
         if self.engine_outputs:
-            value = getattr(self.engine_outputs[0], name)
-            if name == "prompt_token_ids" and not value:
-                return _prompt_token_ids_from_prompt(self.original_prompt) or value
+            try:
+                value = getattr(self.engine_outputs[0], name)
+            except AttributeError:
+                if name == "prompt_token_ids":
+                    original_ids = _prompt_token_ids_from_prompt(self.original_prompt)
+                    if original_ids:
+                        return original_ids
+                raise
+            if name == "prompt_token_ids":
+                original_ids = _prompt_token_ids_from_prompt(self.original_prompt)
+                if _should_use_original_prompt_token_ids(value, original_ids):
+                    return original_ids
             return value
         raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
@@ -634,9 +645,39 @@ def _prompt_token_ids_from_prompt(prompt: Any) -> list[int] | None:
         prompt = prompt[0] if prompt else None
     if isinstance(prompt, dict):
         token_ids = prompt.get("prompt_token_ids")
-        return list(token_ids) if token_ids else None
+        return _token_ids_list(token_ids)
     token_ids = getattr(prompt, "prompt_token_ids", None)
-    return list(token_ids) if token_ids else None
+    return _token_ids_list(token_ids)
+
+
+def _should_use_original_prompt_token_ids(
+    stage_token_ids: Any, original_token_ids: list[int] | None
+) -> bool:
+    if not original_token_ids:
+        return False
+    current = _token_ids_list(stage_token_ids)
+    if not current:
+        return True
+    # Qwen3-Omni's thinker->talker processor counts chat segments by the
+    # Qwen chat-template start token. Some vLLM output objects expose the raw
+    # user prompt ids here even though the engine ran the chat-template prompt.
+    # Prefer the original chat-template ids so the talker prompt is non-empty.
+    return (
+        _QWEN_CHAT_IM_START_TOKEN_ID in original_token_ids
+        and _QWEN_CHAT_IM_START_TOKEN_ID not in current
+    )
+
+
+def _token_ids_list(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    if hasattr(value, "_x"):
+        value = value._x
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not value:
+        return None
+    return [int(token_id) for token_id in value]
 
 
 def _create_engine(model: str, stage_config: Any, stage_type: str) -> StageEngine:

@@ -125,6 +125,26 @@ def test_proxy_uses_original_prompt_token_ids_when_stage_output_has_none():
     assert proxy.prompt_token_ids == [151644, 872, 198]
 
 
+def test_proxy_prefers_chat_template_prompt_ids_over_raw_stage_ids():
+    output = SimpleNamespace(outputs=["audio"], prompt_token_ids=[872, 198, 9707])
+    proxy = _Proxy(
+        engine_outputs=[output],
+        original_prompt={"prompt_token_ids": [151644, 872, 198, 9707]},
+    )
+
+    assert proxy.prompt_token_ids == [151644, 872, 198, 9707]
+
+
+def test_proxy_keeps_stage_prompt_ids_when_already_chat_formatted():
+    output = SimpleNamespace(outputs=["audio"], prompt_token_ids=[151644, 872, 198])
+    proxy = _Proxy(
+        engine_outputs=[output],
+        original_prompt={"prompt_token_ids": [151644, 8948, 198, 151644, 872, 198]},
+    )
+
+    assert proxy.prompt_token_ids == [151644, 872, 198]
+
+
 def test_load_omni_stage_configs_uses_v020_model_loader(tmp_path):
     stage_configs_path = tmp_path / "deploy.yaml"
     stage_configs_path.write_text("stages:\n  - stage_id: 0\n", encoding="utf-8")
