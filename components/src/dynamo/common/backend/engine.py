@@ -60,13 +60,17 @@ class EngineConfig:
     total_kv_blocks: Optional[int] = None
     max_num_seqs: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
-    # Bootstrap address advertised to decode peers. Only meaningful when
-    # this worker's `WorkerConfig.disaggregation_mode == DisaggregationMode.PREFILL`.
-    # When both are populated, the Rust `Worker` calls
-    # `set_disaggregated_endpoint` so the frontend's `PrefillRouter` can
-    # take its optimised "Bootstrap path" (route decode concurrent with
-    # prefill). Engines populate these from `start()` after the engine
-    # has resolved its KV-transport listening address.
+    # Bootstrap address advertised to decode peers. Only meaningful for
+    # backends with a Dynamo-level host/port handshake (today: SGLang).
+    # Backends whose KV transport is internal — TRT-LLM, vLLM
+    # NixlConnector — leave these None.
+    #
+    # Engines that do use it populate these from `start()` after the
+    # engine has resolved its KV-transport listening address. When both
+    # are set, the Rust Worker publishes them via
+    # `ModelRuntimeConfig.disaggregated_endpoint` so the frontend's
+    # `PrefillRouter` can take its optimised Bootstrap path (route
+    # decode concurrent with prefill).
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
 

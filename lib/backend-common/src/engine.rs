@@ -53,13 +53,21 @@ pub struct EngineConfig {
     /// Maximum tokens the engine will process in a single batched step.
     pub max_num_batched_tokens: Option<u64>,
     /// Bootstrap host this prefill worker advertises to decode peers.
-    /// Only meaningful when `disaggregation_mode == Prefill`. Set this
-    /// in `start()` after the engine has resolved its bootstrap address
-    /// (SGLang reads `tokenizer_manager.server_args.disaggregation_bootstrap_port`,
-    /// for example). When both this and `bootstrap_port` are populated,
-    /// `Worker` publishes them via `ModelRuntimeConfig::set_disaggregated_endpoint`
-    /// so the frontend's `PrefillRouter` can take its optimised
-    /// "Bootstrap path" (route decode concurrent with prefill).
+    ///
+    /// Only meaningful for backends with a Dynamo-level host/port
+    /// handshake (today: SGLang). Backends whose KV transport is
+    /// internal — TRT-LLM uses TRT-LLM's transceiver, vLLM uses vLLM's
+    /// `NixlConnector` — should leave this `None`.
+    ///
+    /// Engines that do use it set this in `start()` after the engine
+    /// has resolved its bootstrap address (SGLang reads
+    /// `tokenizer_manager.server_args.disaggregation_bootstrap_port`).
+    /// When both `bootstrap_host` and `bootstrap_port` are `Some`,
+    /// `Worker` publishes them via
+    /// `ModelRuntimeConfig::disaggregated_endpoint` so the frontend's
+    /// `PrefillRouter` can take its optimised "Bootstrap path" (route
+    /// decode concurrent with prefill instead of waiting for prefill
+    /// to drain).
     pub bootstrap_host: Option<String>,
     /// Bootstrap port for disaggregated KV transfer. See `bootstrap_host`.
     pub bootstrap_port: Option<u16>,

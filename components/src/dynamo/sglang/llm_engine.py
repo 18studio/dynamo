@@ -316,6 +316,12 @@ class SglangLLMEngine(LLMEngine):
              Bootstrap path (no published endpoint, multi-node fallout, etc.).
              The Completed path will forward this triple to the decode
              peer via ``prefill_result.disaggregated_params``.
+
+        A non-empty ``bootstrap_info`` missing fields is a router contract
+        violation (the router writes complete triples or nothing). We log
+        a warning and fill the missing fields from defaults so the request
+        doesn't fail outright, but operators should treat the warning as a
+        signal that the decode peer probably won't find this room.
         """
         assert (
             self._bootstrap_host is not None and self._bootstrap_port is not None
@@ -323,6 +329,18 @@ class SglangLLMEngine(LLMEngine):
 
         bootstrap_info_from_req = request.get("bootstrap_info") or {}
         if isinstance(bootstrap_info_from_req, dict) and bootstrap_info_from_req:
+            missing = [
+                k
+                for k in ("bootstrap_host", "bootstrap_port", "bootstrap_room")
+                if k not in bootstrap_info_from_req
+            ]
+            if missing:
+                logger.warning(
+                    "prefill request bootstrap_info is incomplete (missing %s); "
+                    "filling from engine defaults — decode peer may not find "
+                    "this room. Likely a Rust PrefillRouter contract violation.",
+                    missing,
+                )
             host = bootstrap_info_from_req.get("bootstrap_host", self._bootstrap_host)
             port = bootstrap_info_from_req.get("bootstrap_port", self._bootstrap_port)
             room = bootstrap_info_from_req.get("bootstrap_room")
@@ -376,9 +394,21 @@ class SglangLLMEngine(LLMEngine):
         stream: AsyncGenerator[Any, None], context: Context
     ) -> None:
         """Drain a prefill engine stream after the bootstrap chunk has
-        been yielded. Errors are swallowed (best-effort): if the
-        decode peer never connects, this loop just exits when the
-        engine times out or the request is aborted."""
+        been yielded. Errors are swallowed (best-effort): if the decode
+        peer never connects, this loop just exits when the engine times
+        out or the request is aborted.
+
+        Caveat — late-abort gap: this task outlives the Rust adapter's
+        cancellation monitor (which is dropped when the response stream
+        ends, i.e. immediately after the bootstrap chunk is yielded).
+        A client cancel arriving after the response stream has closed
+        will NOT propagate here as `engine.abort()`. The drain still
+        terminates when SGLang's own request timeout fires or the
+        engine sends a final completion signal — so the worst-case
+        impact is a wedged background task, not a hung request.
+        Closing this gap properly would require keeping the response
+        stream open until the drain completes; out of scope here.
+        """
         try:
             async for _ in stream:
                 if context.is_stopped():
@@ -386,8 +416,14 @@ class SglangLLMEngine(LLMEngine):
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.debug(
-                "prefill consume task ended with exception", exc_info=True
+            # Surface as a warning so operators investigating "decode
+            # never received KV" can grep for it. A real engine error
+            # (NIXL transport failure, etc.) leaves the decode peer
+            # waiting on a transfer that will never come.
+            logger.warning(
+                "prefill consume task ended with exception (decode peer "
+                "may be waiting on a KV transfer that will not arrive)",
+                exc_info=True,
             )
 
     def _resolve_bootstrap_info(self) -> tuple[str, int]:

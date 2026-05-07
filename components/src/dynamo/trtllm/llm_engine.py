@@ -13,6 +13,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import random
 import re
 import sys
 from collections.abc import AsyncGenerator
@@ -56,6 +57,13 @@ logger = logging.getLogger(__name__)
 _DRAIN_TIMEOUT_S = 30.0
 _DRAIN_POLL_INTERVAL_S = 0.5
 
+# Range for the per-worker `disagg_machine_id` used as the snowflake bits
+# of every `disagg_request_id`. Matches the legacy non-unified path
+# (`workers/llm_worker.py: connection_id() % 1021`). 1021 is the largest
+# 10-bit prime; we use it (and not 1024) to spread machine_ids more evenly
+# under modulo distributions of small worker pools.
+_DISAGG_MACHINE_ID_MAX = 1021
+
 # `dynamo.trtllm.constants.DisaggregationMode` predates the unified
 # abstraction and uses different string values from
 # `dynamo.common.constants.DisaggregationMode` ("prefill_and_decode" vs.
@@ -95,11 +103,15 @@ class TrtllmLLMEngine(LLMEngine):
         self._engine: TensorRTLLMEngine | None = None
         self._default_sampling_params = SamplingParams(detokenize=False)
         self._active_requests: dict[str, Any] = {}
-        # 10-bit machine_id for the TRT-LLM snowflake disagg_request_id.
-        # 0 is fine for the unified path because each worker process owns
-        # one engine — id collisions only matter when multiple engines
-        # share the same machine_id within a single distributed runtime.
-        self._disagg_machine_id = 0
+        # 10-bit machine_id for the TRT-LLM snowflake `disagg_request_id`.
+        # That ID is the cluster-wide key the PYTHON transceiver uses to
+        # match prefill→decode contexts, so two prefill replicas using
+        # the same machine_id will eventually mint colliding IDs and
+        # route a decode pull to the wrong context. Randomize per-process
+        # to mirror the legacy `connection_id() % 1021` pattern; the Rust
+        # `Worker` owns the endpoint in the unified path so we can't
+        # derive from it here.
+        self._disagg_machine_id = random.randint(0, _DISAGG_MACHINE_ID_MAX - 1)
 
     @classmethod
     async def from_args(
