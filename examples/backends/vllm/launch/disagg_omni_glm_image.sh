@@ -16,7 +16,7 @@ MODEL="${MODEL:-zai-org/GLM-Image}"
 
 # Resolve vllm-omni's built-in GLM-Image stage config
 if [ -z "$STAGE_CONFIG" ]; then
-    STAGE_CONFIG="$(python -c "import vllm_omni, os; print(os.path.join(os.path.dirname(vllm_omni.__file__), 'model_executor/stage_configs/glm_image.yaml'))" 2>/dev/null | tail -1)"
+    STAGE_CONFIG="$(python -c "import vllm_omni, os; print(os.path.join(os.path.dirname(vllm_omni.__file__), 'deploy/glm_image.yaml'))" 2>/dev/null | tail -1)"
 fi
 
 EXTRA_ARGS=()

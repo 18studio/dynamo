@@ -12,11 +12,16 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
 import yaml
-from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
+from vllm_omni.distributed.omni_connectors import (
+    ConnectorSpec,
+    OmniConnectorFactory,
+    initialize_orchestrator_connectors,
+)
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.stage_utils import serialize_obj, shm_write_bytes
-from vllm_omni.entrypoints.utils import load_stage_configs_from_yaml
+from vllm_omni.entrypoints.utils import load_stage_configs_from_model
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 from dynamo import prometheus_names
@@ -33,13 +38,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _Proxy:
-    """Satisfies stage_list[i].engine_outputs for processor functions.
-
-    Processor functions (e.g. ar2diffusion) access stage_list[i].engine_outputs
-    as a list of OmniRequestOutput objects.
-    """
+    """Expose previous-stage output attributes to vLLM-Omni v0.20 processors."""
 
     engine_outputs: Any = None
+    original_prompt: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self.engine_outputs:
+            value = getattr(self.engine_outputs[0], name)
+            if name == "prompt_token_ids" and not value:
+                return _prompt_token_ids_from_prompt(self.original_prompt) or value
+            return value
+        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
 
 class OmniStageWorker:
@@ -92,28 +102,39 @@ class OmniStageWorker:
             # Stage N > 0: fetch previous stage outputs from connectors, run pre-processor.
             sampling_params_list_override = req.sampling_params_list
             try:
-                stage_list = self._fetch_stage_inputs(stage_connector_refs, request_id)
+                stage_list = self._fetch_stage_inputs(
+                    stage_connector_refs, request_id, original_prompt
+                )
             except RuntimeError as e:
                 yield {"error": str(e), "finished": True}
                 return
 
-            if len(stage_list) != len(
-                self._engine_input_source or stage_connector_refs
-            ):
+            input_count = sum(
+                1 for item in stage_list if item.engine_outputs is not None
+            )
+            if input_count != len(self._engine_input_source or stage_connector_refs):
                 logger.warning(
                     "Stage %d: expected %d stage inputs, got %d",
                     self.stage_id,
                     len(self._engine_input_source or stage_connector_refs),
-                    len(stage_list),
+                    input_count,
                 )
 
             if self._processor is not None:
-                prompt = self._processor(
+                prompt = self._run_processor(
                     stage_list,
-                    self._engine_input_source,
-                    [original_prompt],
-                    self._requires_mm,
+                    stage_connector_refs,
+                    original_prompt,
                 )
+                if isinstance(prompt, list) and not prompt:
+                    yield {
+                        "error": (
+                            f"Stage {self.stage_id}: processor produced no engine "
+                            "inputs from upstream stage output"
+                        ),
+                        "finished": True,
+                    }
+                    return
                 if isinstance(prompt, list) and len(prompt) == 1:
                     prompt = prompt[0]
             else:
@@ -155,13 +176,26 @@ class OmniStageWorker:
         )
 
         sp = _build_sampling_params(self.stage_config, sampling_params_list_override)
+        if stage_connector_refs:
+            try:
+                prompt = self._build_engine_core_request_from_stage_prompt(
+                    prompt, request_id, sp
+                )
+            except RuntimeError as e:
+                yield {"error": str(e), "finished": True}
+                return
         last_result = None
+        interstage_result = None
 
         try:
             async for chunk in self.engine.generate(
-                prompt, request_id=request_id, sampling_params_list=sp
+                prompt,
+                request_id=request_id,
+                sampling_params_list=sp,
             ):
                 last_result = chunk
+                if _has_multimodal_stage_payload(chunk):
+                    interstage_result = chunk
         except Exception as e:
             logger.error(
                 "Stage %d engine error for %s: %s",
@@ -173,6 +207,9 @@ class OmniStageWorker:
             yield {"error": str(e), "finished": True}
             return
 
+        _ensure_cumulative_token_ids(last_result)
+        _ensure_cumulative_token_ids(interstage_result)
+
         # --- Write output ---
         # Check for a downstream connector first, regardless of final_output.
         # In vllm-omni's native mode, multiple stages can set final_output=True
@@ -182,9 +219,10 @@ class OmniStageWorker:
         from_s, to_s = _connector_key(self.stage_id, self.stage_id + 1)
         connector = self.connectors.get((from_s, to_s))
         if connector is not None:
+            connector_result = interstage_result or last_result
             try:
                 ok, _, metadata = connector.put(  # type: ignore[arg-type]
-                    from_s, to_s, request_id, last_result
+                    from_s, to_s, request_id, connector_result
                 )
             except Exception as e:
                 logger.error(
@@ -253,13 +291,31 @@ class OmniStageWorker:
             ) from e
 
         tokens_prompt = OmniTokensPrompt(prompt_token_ids=list(token_ids))
-        sp_list = _build_sampling_params(
-            self.stage_config, sampling_params_list_override
+        return self._build_engine_core_request_from_stage_prompt(
+            tokens_prompt,
+            request_id,
+            _build_sampling_params(self.stage_config, sampling_params_list_override),
         )
-        params = sp_list[0] if sp_list else None
+
+    def _build_engine_core_request_from_stage_prompt(
+        self,
+        prompt: Any,
+        request_id: str,
+        sampling_params_list: list | None,
+    ) -> Any:
+        """Wrap downstream token prompts the same way vLLM-Omni's orchestrator does."""
+        if isinstance(prompt, OmniEngineCoreRequest):
+            return prompt
+        has_token_ids = hasattr(prompt, "prompt_token_ids") or (
+            isinstance(prompt, dict) and "prompt_token_ids" in prompt
+        )
+        if not has_token_ids or not sampling_params_list:
+            return prompt
+
+        params = sampling_params_list[0]
         prompt = build_engine_core_request_from_tokens(
             request_id=request_id,
-            prompt=tokens_prompt,
+            prompt=prompt,
             params=params,
         )
         # Pre-built EngineCoreRequests skip the output processor registration
@@ -277,16 +333,22 @@ class OmniStageWorker:
         return prompt
 
     def _fetch_stage_inputs(
-        self, stage_connector_refs: dict[int, Any], request_id: str
+        self,
+        stage_connector_refs: dict[int, Any],
+        request_id: str,
+        original_prompt: Any = None,
     ) -> list[_Proxy]:
         """Fetch previous stage outputs from connectors for the processor/engine.
 
         Fetches only the stages listed in engine_input_source (or all refs if empty).
-        Returns _Proxy objects in engine_input_source order.
+        Returns a sparse list indexed by original stage id.
         Raises RuntimeError on any failure so the caller can propagate it as an error chunk.
         """
         sources = self._engine_input_source or sorted(stage_connector_refs.keys())
-        stage_list = []
+        stage_list = [
+            _Proxy(original_prompt=original_prompt)
+            for _ in range(max(sources, default=-1) + 1)
+        ]
         for stage_k in sources:
             if (meta_k := stage_connector_refs.get(stage_k)) is None:
                 raise RuntimeError(
@@ -316,8 +378,28 @@ class OmniStageWorker:
                 if isinstance(payload_data, dict)
                 else payload_data
             )
-            stage_list.append(_Proxy(engine_outputs=[engine_inputs]))
+            _ensure_cumulative_token_ids(engine_inputs)
+            stage_list[stage_k] = _Proxy(
+                engine_outputs=[engine_inputs],
+                original_prompt=original_prompt,
+            )
         return stage_list
+
+    def _run_processor(
+        self,
+        stage_list: list[_Proxy],
+        stage_connector_refs: dict[int, Any],
+        original_prompt: Any,
+    ) -> Any:
+        """Invoke vLLM-Omni v0.20 stage processors."""
+        sources = self._engine_input_source or sorted(stage_connector_refs.keys())
+        source_outputs = [stage_list[stage_id] for stage_id in sources]
+        return self._processor(
+            source_outputs,
+            original_prompt,
+            self._requires_mm,
+            None,
+        )
 
 
 async def init_omni_stage(
@@ -333,7 +415,7 @@ async def init_omni_stage(
     if config.stage_id is None:
         raise ValueError("--stage-id is required for stage worker initialization")
     stage_id: int = config.stage_id
-    stage_configs = load_stage_configs_from_yaml(config.stage_configs_path)  # type: ignore[arg-type]
+    stage_configs = load_omni_stage_configs(config.model, config.stage_configs_path)
     if stage_id >= len(stage_configs):
         raise ValueError(
             f"--stage-id {stage_id} out of range (YAML has {len(stage_configs)} stages)"
@@ -353,6 +435,7 @@ async def init_omni_stage(
     # Connectors for inter-stage output transfer — type determined by YAML config
     # (SharedMemoryConnector, MooncakeConnector, etc.)
     _, connectors = initialize_orchestrator_connectors(config.stage_configs_path)  # type: ignore[arg-type]
+    connectors = ensure_omni_stage_connectors(stage_configs, connectors)
 
     worker = OmniStageWorker(
         engine=engine,
@@ -405,9 +488,37 @@ async def init_omni_stage(
         raise
 
 
-def _connector_key(from_stage: int, to_stage: int) -> tuple[str, str]:
+def _connector_key(from_stage: int | str, to_stage: int | str) -> tuple[str, str]:
     """Build the connector dict key used by initialize_orchestrator_connectors."""
     return (str(from_stage), str(to_stage))
+
+
+def ensure_omni_stage_connectors(
+    stage_configs: list[Any],
+    connectors: dict[tuple[str, str], Any],
+) -> dict[tuple[str, str], Any]:
+    """Add default SHM connectors for v0.20 deploy config stage dependencies."""
+    resolved = dict(connectors)
+    for idx, stage_config in enumerate(stage_configs):
+        to_stage = getattr(stage_config, "stage_id", idx)
+        for from_stage in getattr(stage_config, "engine_input_source", []) or []:
+            edge = _connector_key(from_stage, to_stage)
+            if edge in resolved:
+                continue
+            resolved[edge] = OmniConnectorFactory.create_connector(
+                ConnectorSpec(
+                    name="SharedMemoryConnector",
+                    extra={"shm_threshold_bytes": 65536},
+                )
+            )
+    return resolved
+
+
+def load_omni_stage_configs(model: str, stage_configs_path: str | None) -> list[Any]:
+    """Load vLLM-Omni v0.20 deploy configs."""
+    if stage_configs_path is None:
+        raise ValueError("--stage-configs-path is required")
+    return load_stage_configs_from_model(model, deploy_config_path=stage_configs_path)
 
 
 def _load_processor(func_path: str | None) -> Any:
@@ -416,6 +527,51 @@ def _load_processor(func_path: str | None) -> Any:
         return None
     module_path, func_name = func_path.rsplit(".", 1)
     return getattr(importlib.import_module(module_path), func_name)
+
+
+def _ensure_cumulative_token_ids(result: Any) -> None:
+    """Expose token_ids in the cumulative field used by vLLM-Omni processors."""
+    for output in getattr(result, "outputs", []) or []:
+        if not hasattr(output, "cumulative_token_ids") and hasattr(output, "token_ids"):
+            output.cumulative_token_ids = list(output.token_ids)
+        _ensure_completion_multimodal_output(result, output)
+
+
+def _has_multimodal_stage_payload(result: Any) -> bool:
+    """Return true when a chunk carries latent payload for a downstream stage."""
+    multimodal_output = getattr(result, "multimodal_output", None)
+    if isinstance(multimodal_output, dict) and multimodal_output:
+        return True
+    for output in getattr(result, "outputs", []) or []:
+        multimodal_output = getattr(output, "multimodal_output", None)
+        if isinstance(multimodal_output, dict) and multimodal_output:
+            return True
+    return False
+
+
+def _ensure_completion_multimodal_output(result: Any, output: Any) -> None:
+    """Make request-level multimodal payload visible to v0.20 processors."""
+    request_mm = getattr(result, "multimodal_output", None)
+    if not isinstance(request_mm, dict) or not request_mm:
+        return
+
+    output_mm = getattr(output, "multimodal_output", None)
+    if not isinstance(output_mm, dict) or not output_mm:
+        setattr(output, "multimodal_output", dict(request_mm))
+        return
+
+    for key, value in request_mm.items():
+        output_mm.setdefault(key, value)
+
+
+def _prompt_token_ids_from_prompt(prompt: Any) -> list[int] | None:
+    if isinstance(prompt, list):
+        prompt = prompt[0] if prompt else None
+    if isinstance(prompt, dict):
+        token_ids = prompt.get("prompt_token_ids")
+        return list(token_ids) if token_ids else None
+    token_ids = getattr(prompt, "prompt_token_ids", None)
+    return list(token_ids) if token_ids else None
 
 
 def _create_engine(model: str, stage_config: Any, stage_type: str) -> StageEngine:

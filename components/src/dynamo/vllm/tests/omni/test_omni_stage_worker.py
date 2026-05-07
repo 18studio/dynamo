@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 try:
-    from dynamo.vllm.omni.stage_worker import OmniStageWorker, _Proxy
+    from dynamo.vllm.omni.stage_worker import (
+        OmniStageWorker,
+        _Proxy,
+        ensure_omni_stage_connectors,
+        load_omni_stage_configs,
+    )
     from dynamo.vllm.omni.utils import _build_sampling_params
 except ImportError:
     pytest.skip("vLLM omni dependencies not available", allow_module_level=True)
@@ -59,6 +64,23 @@ class _ErrorEngine:
         return _gen()
 
 
+class _MultiChunkEngine(_MockEngine):
+    def __init__(self, chunks):
+        super().__init__()
+        self._chunks = chunks
+
+    def generate(self, prompt, request_id="", *, sampling_params_list=None):
+        self.received_prompt = prompt
+        self.received_request_id = request_id
+        self.received_sampling_params_list = sampling_params_list
+
+        async def _gen():
+            for chunk in self._chunks:
+                yield chunk
+
+        return _gen()
+
+
 class _MockContext:
     def id(self):
         return "test-req-id"
@@ -82,6 +104,63 @@ def _make_worker(engine=None, stage_config=None, connectors=None, stage_id=0):
         connectors=connectors or {},
         stage_id=stage_id,
     )
+
+
+def test_proxy_forwards_attributes_to_first_engine_output():
+    output = SimpleNamespace(outputs=["image"], token_ids=[1, 2, 3])
+    proxy = _Proxy(engine_outputs=[output])
+
+    assert proxy.outputs == ["image"]
+    assert proxy.token_ids == [1, 2, 3]
+
+
+def test_proxy_uses_original_prompt_token_ids_when_stage_output_has_none():
+    output = SimpleNamespace(outputs=["audio"], prompt_token_ids=[])
+    proxy = _Proxy(
+        engine_outputs=[output],
+        original_prompt={"prompt_token_ids": [151644, 872, 198]},
+    )
+
+    assert proxy.prompt_token_ids == [151644, 872, 198]
+
+
+def test_load_omni_stage_configs_uses_v020_model_loader(tmp_path):
+    stage_configs_path = tmp_path / "deploy.yaml"
+    stage_configs_path.write_text("stages:\n  - stage_id: 0\n", encoding="utf-8")
+    expected = [object()]
+
+    with patch(
+        "dynamo.vllm.omni.stage_worker.load_stage_configs_from_model",
+        return_value=expected,
+    ) as deploy_loader:
+        assert (
+            load_omni_stage_configs("zai-org/GLM-Image", str(stage_configs_path))
+            is expected
+        )
+
+    deploy_loader.assert_called_once_with(
+        "zai-org/GLM-Image", deploy_config_path=str(stage_configs_path)
+    )
+
+
+def test_ensure_omni_stage_connectors_adds_missing_engine_input_edges():
+    existing = {("0", "1"): object()}
+    created = object()
+    stage_configs = [
+        _make_stage_config(stage_id=0),
+        _make_stage_config(stage_id=1, engine_input_source=[0]),
+        _make_stage_config(stage_id=2, engine_input_source=[1]),
+    ]
+
+    with patch(
+        "dynamo.vllm.omni.stage_worker.OmniConnectorFactory.create_connector",
+        return_value=created,
+    ) as create_connector:
+        connectors = ensure_omni_stage_connectors(stage_configs, existing)
+
+    assert connectors[("0", "1")] is existing[("0", "1")]
+    assert connectors[("1", "2")] is created
+    create_connector.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -179,7 +258,7 @@ async def test_stage_connector_refs_builds_engine_core_request():
 
 @pytest.mark.asyncio
 async def test_stage_connector_refs_with_processor():
-    """Stage N>0 with processor: processor receives stage_list built from connector output."""
+    """Stage N>0 with processor: v0.20 processor receives source outputs."""
     engine = _MockEngine()
     fetched_output = {"latents": [0.1, 0.2]}
     processed_prompt = {"diffusion_input": True}
@@ -192,12 +271,18 @@ async def test_stage_connector_refs_with_processor():
 
     processor_calls = []
 
-    def mock_processor(stage_list, engine_input_source, original_prompts, requires_mm):
+    def mock_processor(
+        source_outputs,
+        original_prompt,
+        requires_multimodal_data,
+        streaming_context,
+    ):
         processor_calls.append(
             {
-                "stage_list": stage_list,
-                "engine_input_source": engine_input_source,
-                "original_prompts": original_prompts,
+                "source_outputs": source_outputs,
+                "original_prompt": original_prompt,
+                "requires_multimodal_data": requires_multimodal_data,
+                "streaming_context": streaming_context,
             }
         )
         return [processed_prompt]
@@ -226,10 +311,78 @@ async def test_stage_connector_refs_with_processor():
     chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
 
     assert len(processor_calls) == 1
-    assert processor_calls[0]["stage_list"][0].engine_outputs == [fetched_output]
-    assert processor_calls[0]["original_prompts"] == [{"prompt": "hi", "height": 480}]
+    assert processor_calls[0]["source_outputs"][0].engine_outputs == [fetched_output]
+    assert processor_calls[0]["original_prompt"] == {"prompt": "hi", "height": 480}
+    assert processor_calls[0]["streaming_context"] is None
     assert engine.received_prompt == processed_prompt
     assert chunks[0]["stage_connector_refs"]["1"] == {"name": "ref1"}
+
+
+@pytest.mark.asyncio
+async def test_processor_empty_output_yields_error_chunk():
+    engine = _MockEngine()
+    upstream = SimpleNamespace(outputs=[SimpleNamespace(token_ids=[10, 11])])
+    in_connector = MagicMock()
+    in_connector.get.return_value = upstream
+
+    worker = _make_worker(
+        engine=engine,
+        connectors={("0", "1"): in_connector},
+        stage_id=1,
+        stage_config=_make_stage_config(engine_input_source=[0]),
+    )
+    worker._processor = lambda *_args: []
+    worker._engine_input_source = [0]
+    request = {
+        "request_id": "req-empty-processor",
+        "original_prompt": {"prompt": "hello"},
+        "stage_connector_refs": {"0": {"name": "ref0"}},
+    }
+
+    chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
+
+    assert chunks == [
+        {
+            "error": (
+                "Stage 1: processor produced no engine inputs from upstream "
+                "stage output"
+            ),
+            "finished": True,
+        }
+    ]
+    assert engine.received_prompt is None
+
+
+@pytest.mark.asyncio
+async def test_connector_uses_multimodal_chunk_for_stage_handoff():
+    latent_chunk = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                token_ids=[10, 11],
+                multimodal_output={"hidden_states": {"layers": {"0": "latent"}}},
+            )
+        ]
+    )
+    final_chunk = SimpleNamespace(
+        outputs=[SimpleNamespace(token_ids=[12], text="visible text")]
+    )
+    engine = _MultiChunkEngine([latent_chunk, final_chunk])
+    out_connector = MagicMock()
+    out_connector.put.return_value = (True, 0, {"name": "ref0"})
+    worker = _make_worker(
+        engine=engine,
+        connectors={("0", "1"): out_connector},
+        stage_id=0,
+    )
+    request = {
+        "request_id": "req-text-audio",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
+
+    out_connector.put.assert_called_once_with("0", "1", "req-text-audio", latent_chunk)
+    assert chunks[0]["stage_connector_refs"]["0"] == {"name": "ref0"}
 
 
 @pytest.mark.asyncio
