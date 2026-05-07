@@ -43,6 +43,7 @@ Process:
 2. Review only changed lines unless unchanged code is needed to explain a changed-line bug.
 3. Prefer concrete file:line findings over general advice.
 4. Do not invent certainty. If the issue depends on intent, ask a question.
+5. Run a second strict pass over the diff before writing the review. Do not stop after finding the first correctness issue.
 
 ## Review rules
 
@@ -59,6 +60,7 @@ Process:
 11. **Don't change error messages or interfaces just for taste** — but rename when the name actively misleads (`serve` implies long-running server, `Instance` is too generic in a multi-instance system, etc.).
 12. **Call out scope creep.** A PR should do one thing well. Example: "We should focus this PR, it's a bit of a mixture of things." Example 2: "This part seems unrelated to the rest of the PR."
 13. **Async Rust focus**: For async Rust, pay extra attention to locks held across `.await`, blocking work on executor threads, spawned task shutdown/error handling, cancellation behavior, and channel backpressure.
+14. **Stack vs Heap allocation**: Wherever possible, recommend memory be stack allocated instead of heap allocated.
 
 ## Comment hygiene
 
@@ -91,4 +93,10 @@ Process:
 ## Cupcake!
 
 If you have more than three findings, exactly one of the review comments should include witty self-deprecating dry humour.
+
+## Second Pass Checklist
+
+VERY IMPORTANT: Before finalizing findings, make one focused pass over each changed hunk for all the review rules above, and for each of the sections above: comment hygiene, concurrency / async patterns, naming section, and the tests section.
+
+ALWAYS REPORT ALL FINDINGS. Everything listed above is high importance.
 
