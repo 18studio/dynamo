@@ -607,10 +607,18 @@ def _stage_config_to_dict(stage_config: Any, stage_type: str) -> dict:
             return dict(vars(obj))
         return obj
 
+    engine_args = _to_plain(stage_config.engine_args)
+    if isinstance(engine_args, dict):
+        # Dynamo runs each vLLM-Omni stage in its own AsyncOmni and owns
+        # inter-stage transfer through the router/connectors. vLLM-Omni
+        # async_chunk expects one native orchestrator to pre-submit downstream
+        # stages, so single-stage workers must emit sync handoff outputs.
+        engine_args["async_chunk"] = False
+
     result: dict = {
         "stage_id": 0,
         "stage_type": stage_type,
-        "engine_args": _to_plain(stage_config.engine_args),
+        "engine_args": engine_args,
         "final_output": True,
         "final_output_type": getattr(stage_config, "final_output_type", "text"),
     }

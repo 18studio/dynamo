@@ -15,6 +15,7 @@ try:
     from dynamo.vllm.omni.stage_worker import (
         OmniStageWorker,
         _Proxy,
+        _stage_config_to_dict,
         ensure_omni_stage_connectors,
         load_omni_stage_configs,
     )
@@ -161,6 +162,25 @@ def test_ensure_omni_stage_connectors_adds_missing_engine_input_edges():
     assert connectors[("0", "1")] is existing[("0", "1")]
     assert connectors[("1", "2")] is created
     create_connector.assert_called_once()
+
+
+def test_single_stage_config_disables_async_chunk_without_mutating_source():
+    engine_args = SimpleNamespace(
+        model_stage="thinker",
+        async_chunk=True,
+        engine_output_type="latent",
+    )
+    stage_config = _make_stage_config(
+        engine_args=engine_args,
+        runtime=SimpleNamespace(devices="0"),
+        default_sampling_params={"max_tokens": 16},
+    )
+
+    result = _stage_config_to_dict(stage_config, "llm")
+
+    assert result["engine_args"]["async_chunk"] is False
+    assert result["engine_args"]["engine_output_type"] == "latent"
+    assert engine_args.async_chunk is True
 
 
 @pytest.mark.asyncio
