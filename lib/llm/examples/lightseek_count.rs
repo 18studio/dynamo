@@ -30,10 +30,10 @@ fn main() -> anyhow::Result<()> {
 
     // model_type from config.json so the registry lookup is robust.
     let cfg_path = model_dir.join("config.json");
-    let cfg_json: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(&cfg_path).with_context(|| {
-            format!("opening {}", cfg_path.display())
-        })?)?;
+    let cfg_json: serde_json::Value = serde_json::from_reader(
+        std::fs::File::open(&cfg_path)
+            .with_context(|| format!("opening {}", cfg_path.display()))?,
+    )?;
     let model_type = cfg_json
         .get("model_type")
         .and_then(|v| v.as_str())

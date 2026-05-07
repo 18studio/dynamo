@@ -67,10 +67,7 @@ struct ImageTokenStr {
 ///
 /// Returns `None` when no tier produces a hit. Callers should treat this as
 /// "MM-aware routing disabled for this model".
-pub fn resolve_image_token_id(
-    model_dir: &Path,
-    tokenizer: &dyn Tokenizer,
-) -> Option<TokenIdType> {
+pub fn resolve_image_token_id(model_dir: &Path, tokenizer: &dyn Tokenizer) -> Option<TokenIdType> {
     // Tier 1: numeric ID in config.json
     if let Some(cfg) = load_json::<ConfigJson>(model_dir, "config.json")
         && let Some(id) = cfg
@@ -189,7 +186,9 @@ mod tests {
             _ids: &[crate::tokenizers::TokenIdType],
             _skip_special_tokens: bool,
         ) -> anyhow::Result<crate::tokenizers::traits::DecodeResult> {
-            Ok(crate::tokenizers::traits::DecodeResult::Complete(String::new()))
+            Ok(crate::tokenizers::traits::DecodeResult::Complete(
+                String::new(),
+            ))
         }
     }
 
@@ -203,11 +202,7 @@ mod tests {
     #[test]
     fn tier1_image_token_id() {
         let tmp = tempfile::tempdir().unwrap();
-        write_json(
-            tmp.path(),
-            "config.json",
-            r#"{"image_token_id": 151655}"#,
-        );
+        write_json(tmp.path(), "config.json", r#"{"image_token_id": 151655}"#);
         let tk = StubTokenizer(Default::default());
         assert_eq!(resolve_image_token_id(tmp.path(), &tk), Some(151655));
     }
@@ -216,11 +211,7 @@ mod tests {
     #[test]
     fn tier1_image_token_index() {
         let tmp = tempfile::tempdir().unwrap();
-        write_json(
-            tmp.path(),
-            "config.json",
-            r#"{"image_token_index": 32000}"#,
-        );
+        write_json(tmp.path(), "config.json", r#"{"image_token_index": 32000}"#);
         let tk = StubTokenizer(Default::default());
         assert_eq!(resolve_image_token_id(tmp.path(), &tk), Some(32000));
     }

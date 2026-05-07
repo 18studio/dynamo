@@ -28,11 +28,7 @@ impl LightseekMmCounter {
     /// or no registered processor matches `model_id` / `model_type`. Callers
     /// should treat the error as "MM-aware routing disabled for this model"
     /// rather than failing the request.
-    pub fn try_new(
-        model_id: &str,
-        model_type: Option<&str>,
-        model_dir: &Path,
-    ) -> Result<Self> {
+    pub fn try_new(model_id: &str, model_type: Option<&str>, model_dir: &Path) -> Result<Self> {
         let cfg_path = model_dir.join("preprocessor_config.json");
         let json = std::fs::read_to_string(&cfg_path).with_context(|| {
             format!(

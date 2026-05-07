@@ -41,9 +41,9 @@ use std::borrow::Cow;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 use tracing;
 
-use crate::model_card::{ModelDeploymentCard, ModelInfo};
 #[cfg(feature = "lightseek-mm")]
 use crate::model_card::ModelInfoType;
+use crate::model_card::{ModelDeploymentCard, ModelInfo};
 use crate::preprocessor::media::MediaLoader;
 use crate::preprocessor::prompt::OAIChatLikeRequest;
 use crate::protocols::common::preprocessor::{
@@ -262,14 +262,11 @@ impl OpenAIPreprocessor {
                 let (counter, counter_err): (
                     Option<Arc<lightseek_mm::LightseekMmCounter>>,
                     Option<String>,
-                ) = match lightseek_mm::LightseekMmCounter::try_new(
-                    &model_id, None, &model_dir,
-                ) {
+                ) = match lightseek_mm::LightseekMmCounter::try_new(&model_id, None, &model_dir) {
                     Ok(c) => (Some(Arc::new(c)), None),
                     Err(e) => (None, Some(e.to_string())),
                 };
-                let img_tok =
-                    image_token::resolve_image_token_id(&model_dir, tokenizer.as_ref());
+                let img_tok = image_token::resolve_image_token_id(&model_dir, tokenizer.as_ref());
 
                 match (counter.is_some(), img_tok.is_some()) {
                     (true, true) => tracing::info!(
@@ -786,11 +783,7 @@ impl OpenAIPreprocessor {
                     .iter()
                     .map(|e| {
                         // 16 hex chars (u64) + 48 zeros = 64 chars total
-                        serde_json::Value::String(format!(
-                            "{:016x}{}",
-                            e.mm_hash,
-                            "0".repeat(48)
-                        ))
+                        serde_json::Value::String(format!("{:016x}{}", e.mm_hash, "0".repeat(48)))
                     })
                     .collect();
                 extra_args["mm_hashes"] = serde_json::Value::Array(hexes);
@@ -921,7 +914,8 @@ impl OpenAIPreprocessor {
                 offsets: vec![(s, e)],
             })
             .collect();
-        let block_mm_infos = RequestExtraInfo { mm_objects }.to_block_level(block_size, total_tokens);
+        let block_mm_infos =
+            RequestExtraInfo { mm_objects }.to_block_level(block_size, total_tokens);
 
         tracing::debug!(
             target: "lightseek_mm",
@@ -2232,8 +2226,7 @@ impl
         } else {
             // Normal path: tokenize the prompt; embeddings don't need MM routing,
             // so install tokens on the builder right away.
-            let (token_ids, ann) =
-                self.gather_tokens(&request, None, tracker.as_deref())?;
+            let (token_ids, ann) = self.gather_tokens(&request, None, tracker.as_deref())?;
             builder.token_ids(token_ids);
             ann
         };
@@ -2733,7 +2726,10 @@ mod tests {
     fn hash_normalized_url_keeps_meaningful_query() {
         let a = OpenAIPreprocessor::hash_image_url("https://x.com/i.jpg?width=512");
         let b = OpenAIPreprocessor::hash_image_url("https://x.com/i.jpg?width=1024");
-        assert_ne!(a, b, "non-cache-buster query params should differentiate hashes");
+        assert_ne!(
+            a, b,
+            "non-cache-buster query params should differentiate hashes"
+        );
     }
 
     /// data: URIs are content-addressed; hashing the entire URI gives content equality.
