@@ -245,6 +245,11 @@ class OmniStageWorker:
                 },
                 "finished": True,
             }
+            if getattr(self.stage_config, "final_output", False):
+                out["shm_meta"] = shm_write_bytes(
+                    serialize_obj(last_result),
+                    name=f"{request_id}-stage-{self.stage_id}",
+                )
             if sampling_params_list_override is not None:
                 out["sampling_params_list"] = sampling_params_list_override
             yield out

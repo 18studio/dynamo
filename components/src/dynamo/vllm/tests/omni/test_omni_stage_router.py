@@ -44,10 +44,16 @@ class _StageClient:
         return _gen()
 
 
-def _make_stage_cfg(stage_id: int):
+def _make_stage_cfg(stage_id: int, **overrides):
+    defaults = dict(
+        final_output=False,
+        final_output_type="text",
+    )
+    defaults.update(overrides)
     return SimpleNamespace(
         stage_id=stage_id,
         engine_args=SimpleNamespace(model_stage=f"stage{stage_id}"),
+        **defaults,
     )
 
 
@@ -199,6 +205,49 @@ async def test_generate_stage_error_stops_pipeline():
     assert not stage1_called
 
 
+@pytest.mark.asyncio
+async def test_generate_text_request_stops_at_text_final_stage():
+    """Text-only Qwen3 requests should not run downstream audio stages."""
+    stage1_called = False
+
+    async def stage0_handler(request):
+        return {"shm_meta": {"stage": 0}, "finished": True}
+
+    async def stage1_handler(request):
+        nonlocal stage1_called
+        stage1_called = True
+        return {"shm_meta": {"stage": 1}, "finished": True}
+
+    mock_formatter = AsyncMock()
+    mock_formatter.format.return_value = {"choices": [{"delta": {"content": "ok"}}]}
+    router = _make_router(
+        stage_configs=[
+            _make_stage_cfg(0, final_output=True, final_output_type="text"),
+            _make_stage_cfg(1, final_output=True, final_output_type="audio"),
+        ],
+        stage_clients={
+            "stage0": _StageClient(stage0_handler),
+            "stage1": _StageClient(stage1_handler),
+        },
+        formatter=mock_formatter,
+        output_modalities=["text", "audio"],
+    )
+
+    request = {"messages": [], "modalities": ["text"]}
+    p1, p2 = _patched_generate(
+        router, request, request_type=RequestType.CHAT_COMPLETION
+    )
+    with p1, p2:
+        with patch.object(
+            stage_router, "shm_deserialize", return_value=SimpleNamespace()
+        ):
+            chunks = [c async for c in router.generate(request, None)]
+
+    assert chunks == [{"choices": [{"delta": {"content": "ok"}}]}]
+    assert not stage1_called
+    mock_formatter.format.assert_awaited_once()
+
+
 # ── existing tests (formatting + error paths) ────────────
 
 
@@ -257,7 +306,9 @@ async def test_generate_yields_error_when_no_shm_meta():
         with patch("dynamo.vllm.omni.stage_router.uuid.uuid4", return_value="r"):
             chunks = [c async for c in router.generate({"prompt": "x"}, context=None)]
 
-    assert chunks == [{"error": "No SHM output from final stage", "finished": True}]
+    assert chunks == [
+        {"error": "No SHM output from final stage 0 (text)", "finished": True}
+    ]
 
 
 # ── issue-007: router forwards raw request to stage 0 ────────────

@@ -381,10 +381,18 @@ async def test_connector_uses_multimodal_chunk_for_stage_handoff():
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
+    with patch(
+        "dynamo.vllm.omni.stage_worker.serialize_obj",
+        return_value=b"serialized",
+    ), patch(
+        "dynamo.vllm.omni.stage_worker.shm_write_bytes",
+        return_value={"name": "text-shm"},
+    ):
+        chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
 
     out_connector.put.assert_called_once_with("0", "1", "req-text-audio", latent_chunk)
     assert chunks[0]["stage_connector_refs"]["0"] == {"name": "ref0"}
+    assert chunks[0]["shm_meta"] == {"name": "text-shm"}
 
 
 @pytest.mark.asyncio

@@ -60,9 +60,20 @@ class OmniStageRouter:
     ) -> AsyncGenerator[dict, None]:
         request_id = str(uuid.uuid4())
         _, request_type = parse_request_type(request, self.config.output_modalities)
+        requested_modalities = _requested_modalities(
+            request, self.config.output_modalities, request_type
+        )
+        final_stage_indices = _requested_final_stage_indices(
+            self.stage_configs, requested_modalities
+        )
+        last_stage_idx = (
+            max(final_stage_indices)
+            if final_stage_indices
+            else len(self.stage_configs) - 1
+        )
 
         stage_outputs: List[StageOutput] = []
-        for stage_idx, stage_cfg in enumerate(self.stage_configs):
+        for stage_idx, stage_cfg in enumerate(self.stage_configs[: last_stage_idx + 1]):
             model_stage = getattr(
                 stage_cfg.engine_args, "model_stage", f"stage{stage_idx}"
             )
@@ -98,11 +109,6 @@ class OmniStageRouter:
                 yield {"error": stage_outputs[-1].error, "finished": True}
                 return
 
-        final = stage_outputs[-1]
-        if not final.shm_meta:
-            yield {"error": "No SHM output from final stage", "finished": True}
-            return
-
         # Build formatting context from the original request
         nvext = request.get("nvext") or {}
         fmt_ctx: Dict[str, Any] = {}
@@ -128,10 +134,34 @@ class OmniStageRouter:
         if output_format is not None:
             fmt_ctx["output_format"] = output_format
 
-        async for chunk in self._format_output(
-            final, request_id, request_type, fmt_ctx
-        ):
-            yield chunk
+        formatted = False
+        for stage_idx, stage_output in enumerate(stage_outputs):
+            if not _should_format_stage(
+                self.stage_configs[stage_idx],
+                requested_modalities,
+                fallback=not final_stage_indices and stage_idx == last_stage_idx,
+            ):
+                continue
+            if not stage_output.shm_meta:
+                final_output_type = getattr(
+                    self.stage_configs[stage_idx], "final_output_type", "unknown"
+                )
+                yield {
+                    "error": (
+                        f"No SHM output from final stage {stage_idx} "
+                        f"({final_output_type})"
+                    ),
+                    "finished": True,
+                }
+                return
+            async for chunk in self._format_output(
+                stage_output, request_id, request_type, fmt_ctx
+            ):
+                formatted = True
+                yield chunk
+
+        if not formatted:
+            yield {"error": "No SHM output from final stage", "finished": True}
 
     async def _format_output(
         self,
@@ -162,6 +192,47 @@ class OmniStageRouter:
                 "error": f"Formatter returned no output for type '{final_output_type}'",
                 "finished": True,
             }
+
+
+def _requested_modalities(
+    request: dict,
+    configured_modalities: list[str],
+    request_type: RequestType,
+) -> list[str]:
+    """Return output modalities requested by this request."""
+    requested = request.get("modalities")
+    if isinstance(requested, list) and requested:
+        return [str(modality).lower() for modality in requested]
+    request_type_value = getattr(request_type, "value", str(request_type))
+    if request_type_value == RequestType.IMAGE_GENERATION.value:
+        return ["image"]
+    if request_type_value == RequestType.VIDEO_GENERATION.value:
+        return ["video"]
+    if request_type_value == RequestType.AUDIO_GENERATION.value:
+        return ["audio"]
+    return [str(modality).lower() for modality in configured_modalities or []]
+
+
+def _requested_final_stage_indices(
+    stage_configs: list[Any], requested_modalities: list[str]
+) -> list[int]:
+    requested = set(requested_modalities)
+    return [
+        idx
+        for idx, stage_config in enumerate(stage_configs)
+        if getattr(stage_config, "final_output", False)
+        and getattr(stage_config, "final_output_type", None) in requested
+    ]
+
+
+def _should_format_stage(
+    stage_config: Any, requested_modalities: list[str], *, fallback: bool = False
+) -> bool:
+    if fallback:
+        return True
+    if not getattr(stage_config, "final_output", False):
+        return False
+    return getattr(stage_config, "final_output_type", None) in set(requested_modalities)
 
 
 async def init_omni_stage_router(
