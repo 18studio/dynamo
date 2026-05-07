@@ -500,19 +500,45 @@ async def test_processor_empty_output_yields_error_chunk():
 
 
 @pytest.mark.asyncio
-async def test_connector_uses_multimodal_chunk_for_stage_handoff():
-    latent_chunk = SimpleNamespace(
+async def test_connector_accumulates_multimodal_chunks_for_stage_handoff():
+    import torch
+
+    first_latent_chunk = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                token_ids=[10],
+                multimodal_output={
+                    "hidden_states": {
+                        "layers": {
+                            "0": torch.tensor([[1.0], [2.0]]),
+                            "24": torch.tensor([[11.0], [12.0]]),
+                        }
+                    },
+                    "embed": {"tts_bos": torch.tensor([[101.0]])},
+                },
+            )
+        ]
+    )
+    second_latent_chunk = SimpleNamespace(
         outputs=[
             SimpleNamespace(
                 token_ids=[10, 11],
-                multimodal_output={"hidden_states": {"layers": {"0": "latent"}}},
+                multimodal_output={
+                    "hidden_states": {
+                        "layers": {
+                            "0": torch.tensor([[3.0]]),
+                            "24": torch.tensor([[13.0]]),
+                        }
+                    },
+                    "embed": {"tts_bos": torch.tensor([[202.0]])},
+                },
             )
         ]
     )
     final_chunk = SimpleNamespace(
-        outputs=[SimpleNamespace(token_ids=[12], text="visible text")]
+        outputs=[SimpleNamespace(token_ids=[10, 11, 12], text="visible text")]
     )
-    engine = _MultiChunkEngine([latent_chunk, final_chunk])
+    engine = _MultiChunkEngine([first_latent_chunk, second_latent_chunk, final_chunk])
     out_connector = MagicMock()
     out_connector.put.return_value = (True, 0, {"name": "ref0"})
     worker = _make_worker(
@@ -530,13 +556,30 @@ async def test_connector_uses_multimodal_chunk_for_stage_handoff():
     with patch(
         "dynamo.vllm.omni.stage_worker.serialize_obj",
         return_value=b"serialized",
-    ), patch(
+    ) as serialize_obj, patch(
         "dynamo.vllm.omni.stage_worker.shm_write_bytes",
         return_value={"name": "text-shm"},
     ):
         chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
 
-    out_connector.put.assert_called_once_with("0", "1", "req-text-audio", latent_chunk)
+    out_connector.put.assert_called_once()
+    connector_result = out_connector.put.call_args.args[3]
+    connector_output = connector_result.outputs[0]
+    assert connector_output.token_ids == [10, 11, 12]
+    assert torch.equal(
+        connector_output.multimodal_output["hidden_states"]["layers"]["0"],
+        torch.tensor([[1.0], [2.0], [3.0]]),
+    )
+    assert torch.equal(
+        connector_output.multimodal_output["hidden_states"]["layers"]["24"],
+        torch.tensor([[11.0], [12.0], [13.0]]),
+    )
+    assert torch.equal(
+        connector_output.multimodal_output["embed"]["tts_bos"],
+        torch.tensor([[101.0]]),
+    )
+    assert not hasattr(final_chunk.outputs[0], "multimodal_output")
+    serialize_obj.assert_called_once_with(final_chunk)
     assert chunks[0]["stage_connector_refs"]["0"] == {"name": "ref0"}
     assert chunks[0]["shm_meta"] == {"name": "text-shm"}
 

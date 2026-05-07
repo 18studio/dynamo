@@ -4,6 +4,7 @@
 """Single-stage omni worker for disaggregated pipelines."""
 
 import asyncio
+import copy
 import importlib
 import logging
 import os
@@ -209,6 +210,7 @@ class OmniStageWorker:
             original_prompt = _with_prompt_token_ids(original_prompt, prompt)
         last_result = None
         interstage_result = None
+        interstage_multimodal_output = None
 
         try:
             async for chunk in self.engine.generate(
@@ -219,6 +221,10 @@ class OmniStageWorker:
                 last_result = chunk
                 if _has_multimodal_stage_payload(chunk):
                     interstage_result = chunk
+                    interstage_multimodal_output = _merge_multimodal_stage_payloads(
+                        interstage_multimodal_output,
+                        _multimodal_stage_payload(chunk),
+                    )
         except Exception as e:
             logger.error(
                 "Stage %d engine error for %s: %s",
@@ -242,7 +248,11 @@ class OmniStageWorker:
         from_s, to_s = _connector_key(self.stage_id, self.stage_id + 1)
         connector = self.connectors.get((from_s, to_s))
         if connector is not None:
-            connector_result = interstage_result or last_result
+            connector_result = _connector_handoff_result(
+                last_result,
+                interstage_result,
+                interstage_multimodal_output,
+            )
             try:
                 ok, _, metadata = connector.put(  # type: ignore[arg-type]
                     from_s, to_s, request_id, connector_result
@@ -624,6 +634,153 @@ def _has_multimodal_stage_payload(result: Any) -> bool:
         if isinstance(multimodal_output, dict) and multimodal_output:
             return True
     return False
+
+
+def _connector_handoff_result(
+    last_result: Any,
+    interstage_result: Any,
+    multimodal_output: dict | None,
+) -> Any:
+    """Build the result shape consumed by vLLM-Omni's sync stage processors."""
+    result = last_result or interstage_result
+    if result is None:
+        return None
+    if isinstance(multimodal_output, dict) and multimodal_output:
+        result = _copy_result_with_outputs(result)
+        _set_multimodal_stage_payload(result, multimodal_output)
+    _ensure_cumulative_token_ids(result)
+    return result
+
+
+def _copy_result_with_outputs(result: Any) -> Any:
+    try:
+        copied = copy.copy(result)
+    except Exception:
+        return result
+
+    outputs = getattr(result, "outputs", None)
+    if outputs is None:
+        return copied
+
+    try:
+        copied.outputs = [copy.copy(output) for output in outputs]
+    except Exception:
+        pass
+    return copied
+
+
+def _set_multimodal_stage_payload(result: Any, multimodal_output: dict) -> None:
+    try:
+        setattr(result, "multimodal_output", multimodal_output)
+    except Exception:
+        pass
+
+    for output in getattr(result, "outputs", []) or []:
+        try:
+            setattr(
+                output, "multimodal_output", _copy_multimodal_mapping(multimodal_output)
+            )
+        except Exception:
+            pass
+
+
+def _multimodal_stage_payload(result: Any) -> dict | None:
+    """Return the payload as vLLM-Omni processors read it from outputs[0]."""
+    for output in getattr(result, "outputs", []) or []:
+        multimodal_output = getattr(output, "multimodal_output", None)
+        if isinstance(multimodal_output, dict) and multimodal_output:
+            return multimodal_output
+
+    multimodal_output = getattr(result, "multimodal_output", None)
+    if isinstance(multimodal_output, dict) and multimodal_output:
+        return multimodal_output
+    return None
+
+
+def _merge_multimodal_stage_payloads(
+    current: dict | None,
+    update: dict | None,
+    path: tuple[str, ...] = (),
+) -> dict | None:
+    if not isinstance(update, dict) or not update:
+        return current
+    if not isinstance(current, dict) or not current:
+        return _copy_multimodal_mapping(update)
+
+    merged = dict(current)
+    for key, value in update.items():
+        key_path = (*path, str(key))
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _merge_multimodal_stage_payloads(
+                existing,
+                value,
+                key_path,
+            )
+        else:
+            merged[key] = _merge_multimodal_stage_value(key_path, existing, value)
+    return merged
+
+
+def _merge_multimodal_stage_value(
+    path: tuple[str, ...], current: Any, update: Any
+) -> Any:
+    if update is None:
+        return current
+    if current is None:
+        return update
+    if _is_sequence_multimodal_path(path):
+        merged = _merge_sequence_multimodal_value(current, update)
+        if merged is not None:
+            return merged
+    if path and path[-1] in {"tts_bos", "tts_eos", "tts_pad"}:
+        return current
+    return update
+
+
+def _is_sequence_multimodal_path(path: tuple[str, ...]) -> bool:
+    return path[:2] == ("hidden_states", "layers") or path in {
+        ("hidden_states", "output"),
+        ("embed", "prefill"),
+        ("embed", "decode"),
+        ("codes", "audio"),
+        ("ids", "output"),
+    }
+
+
+def _merge_sequence_multimodal_value(current: Any, update: Any) -> Any | None:
+    if isinstance(current, list) and isinstance(update, list):
+        # Longer updates are usually cumulative vLLM outputs; otherwise treat
+        # them as streaming deltas and append.
+        return list(update) if len(update) > len(current) else [*current, *update]
+
+    current_shape = getattr(current, "shape", None)
+    update_shape = getattr(update, "shape", None)
+    if current_shape is None or update_shape is None:
+        return None
+    if len(current_shape) == 0 or len(update_shape) == 0:
+        return update
+    if current_shape[1:] != update_shape[1:]:
+        return update
+    if update_shape[0] > current_shape[0]:
+        return update
+
+    try:
+        import torch
+
+        return torch.cat((current, update), dim=0)
+    except Exception:
+        logger.debug(
+            "Failed to merge multimodal payload at sequence path", exc_info=True
+        )
+        return update
+
+
+def _copy_multimodal_mapping(payload: dict) -> dict:
+    return {
+        key: _copy_multimodal_mapping(value) if isinstance(value, dict) else value
+        for key, value in payload.items()
+    }
 
 
 def _ensure_completion_multimodal_output(result: Any, output: Any) -> None:
