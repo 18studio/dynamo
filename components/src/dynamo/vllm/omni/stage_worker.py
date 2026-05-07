@@ -206,6 +206,7 @@ class OmniStageWorker:
             prompt = self._prepare_initial_stage_prompt(
                 prompt, request_id, sp, final_stage_id
             )
+            original_prompt = _with_prompt_token_ids(original_prompt, prompt)
         last_result = None
         interstage_result = None
 
@@ -648,6 +649,20 @@ def _prompt_token_ids_from_prompt(prompt: Any) -> list[int] | None:
         return _token_ids_list(token_ids)
     token_ids = getattr(prompt, "prompt_token_ids", None)
     return _token_ids_list(token_ids)
+
+
+def _with_prompt_token_ids(original_prompt: Any, prompt: Any) -> Any:
+    """Carry vLLM-Omni preprocessed prompt token IDs to downstream processors."""
+    token_ids = _token_ids_list(getattr(prompt, "prompt_token_ids", None))
+    if not token_ids:
+        return original_prompt
+    if isinstance(original_prompt, dict):
+        if original_prompt.get("prompt_token_ids"):
+            return original_prompt
+        enriched = dict(original_prompt)
+        enriched["prompt_token_ids"] = token_ids
+        return enriched
+    return {"prompt": original_prompt, "prompt_token_ids": token_ids}
 
 
 def _should_use_original_prompt_token_ids(

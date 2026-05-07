@@ -429,6 +429,42 @@ async def test_stage0_prebuilds_prompt_with_global_final_stage_id():
 
 
 @pytest.mark.asyncio
+async def test_stage0_forwards_prebuilt_prompt_token_ids_to_downstream_stage():
+    engine = _MockEngine()
+    prebuilt_prompt = SimpleNamespace(prompt_token_ids=[151644, 872, 198, 9707])
+    engine.engine = MagicMock()
+    engine.engine._build_add_request_message.return_value = {"prompt": prebuilt_prompt}
+    out_connector = MagicMock()
+    out_connector.put.return_value = (True, 0, {"name": "ref0"})
+
+    worker = _make_worker(
+        engine=engine,
+        connectors={("0", "1"): out_connector},
+        stage_id=0,
+        stage_config=_make_stage_config(
+            default_sampling_params={"temperature": 0.7, "max_tokens": 16},
+        ),
+    )
+    worker._output_modalities = ["text", "audio"]
+    request = {
+        "request_id": "req-prebuild-token-ids",
+        "messages": [{"role": "user", "content": "hello"}],
+        "modalities": ["text", "audio"],
+        "final_stage_id": 2,
+    }
+
+    chunks = [chunk async for chunk in worker.generate(request, _MockContext())]
+
+    assert engine.received_prompt is prebuilt_prompt
+    assert chunks[0]["original_prompt"]["prompt_token_ids"] == [
+        151644,
+        872,
+        198,
+        9707,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_processor_empty_output_yields_error_chunk():
     engine = _MockEngine()
     upstream = SimpleNamespace(outputs=[SimpleNamespace(token_ids=[10, 11])])
