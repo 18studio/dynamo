@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use dynamo_backend_common::{
-    AsyncEngineContext, BackendError, DynamoError, EngineConfig as RsEngineConfig, ErrorType,
-    LLMEngine, LLMEngineOutput, PreprocessedRequest, RuntimeConfig as RsRuntimeConfig,
-    Worker as RsWorker, WorkerConfig as RsWorkerConfig,
+    AsyncEngineContext, BackendError, DisaggregationMode as RsDisaggregationMode, DynamoError,
+    EngineConfig as RsEngineConfig, ErrorType, LLMEngine, LLMEngineOutput, PreprocessedRequest,
+    RuntimeConfig as RsRuntimeConfig, Worker as RsWorker, WorkerConfig as RsWorkerConfig,
 };
 use dynamo_llm::model_type::ModelInput as RsModelInput;
 use dynamo_runtime as rs;
@@ -41,6 +41,7 @@ use crate::to_pyerr;
 pub fn add_to_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "backend")?;
+    m.add_class::<DisaggregationMode>()?;
     m.add_class::<EngineConfig>()?;
     m.add_class::<RuntimeConfig>()?;
     m.add_class::<WorkerConfig>()?;
@@ -50,6 +51,33 @@ pub fn add_to_module(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         .getattr("modules")?
         .set_item("dynamo._core.backend", &m)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DisaggregationMode — mirror of `dynamo_backend_common::DisaggregationMode`.
+//
+// Variant names and integer values are stable wire format for the Python
+// side. `eq_int` enables `mode == DisaggregationMode.Prefill` plus integer
+// comparisons in tests.
+// ---------------------------------------------------------------------------
+
+#[pyclass(module = "dynamo._core.backend", name = "DisaggregationMode", eq, eq_int)]
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum DisaggregationMode {
+    #[default]
+    Aggregated = 1,
+    Prefill = 2,
+    Decode = 3,
+}
+
+impl From<DisaggregationMode> for RsDisaggregationMode {
+    fn from(value: DisaggregationMode) -> Self {
+        match value {
+            DisaggregationMode::Aggregated => RsDisaggregationMode::Aggregated,
+            DisaggregationMode::Prefill => RsDisaggregationMode::Prefill,
+            DisaggregationMode::Decode => RsDisaggregationMode::Decode,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +106,10 @@ impl EngineConfig {
         total_kv_blocks = None,
         max_num_seqs = None,
         max_num_batched_tokens = None,
+        bootstrap_host = None,
+        bootstrap_port = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         model: String,
         served_model_name: Option<String>,
@@ -87,6 +118,8 @@ impl EngineConfig {
         total_kv_blocks: Option<u64>,
         max_num_seqs: Option<u64>,
         max_num_batched_tokens: Option<u64>,
+        bootstrap_host: Option<String>,
+        bootstrap_port: Option<u16>,
     ) -> Self {
         Self {
             inner: RsEngineConfig {
@@ -97,6 +130,8 @@ impl EngineConfig {
                 total_kv_blocks,
                 max_num_seqs,
                 max_num_batched_tokens,
+                bootstrap_host,
+                bootstrap_port,
             },
         }
     }
@@ -128,6 +163,14 @@ impl EngineConfig {
     #[getter]
     fn max_num_batched_tokens(&self) -> Option<u64> {
         self.inner.max_num_batched_tokens
+    }
+    #[getter]
+    fn bootstrap_host(&self) -> Option<&str> {
+        self.inner.bootstrap_host.as_deref()
+    }
+    #[getter]
+    fn bootstrap_port(&self) -> Option<u16> {
+        self.inner.bootstrap_port
     }
 }
 
@@ -187,6 +230,7 @@ impl WorkerConfig {
         exclude_tools_when_tool_choice_none = true,
         enable_local_indexer = true,
         metrics_labels = Vec::new(),
+        disaggregation_mode = DisaggregationMode::Aggregated,
         runtime = None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -204,6 +248,7 @@ impl WorkerConfig {
         exclude_tools_when_tool_choice_none: bool,
         enable_local_indexer: bool,
         metrics_labels: Vec<(String, String)>,
+        disaggregation_mode: DisaggregationMode,
         runtime: Option<RuntimeConfig>,
     ) -> Self {
         // Delegating to the same conversion used by `register_model`.
@@ -227,6 +272,7 @@ impl WorkerConfig {
                 exclude_tools_when_tool_choice_none,
                 enable_local_indexer,
                 metrics_labels,
+                disaggregation_mode: disaggregation_mode.into(),
                 runtime: runtime.map(|r| r.inner).unwrap_or_default(),
             },
         }
@@ -441,6 +487,8 @@ impl LLMEngine for PyLLMEngine {
                 total_kv_blocks: opt_attr::<u64>(bound, "total_kv_blocks")?,
                 max_num_seqs: opt_attr::<u64>(bound, "max_num_seqs")?,
                 max_num_batched_tokens: opt_attr::<u64>(bound, "max_num_batched_tokens")?,
+                bootstrap_host: opt_attr::<String>(bound, "bootstrap_host")?,
+                bootstrap_port: opt_attr::<u16>(bound, "bootstrap_port")?,
             })
         })
         .map_err(py_err_to_dynamo)

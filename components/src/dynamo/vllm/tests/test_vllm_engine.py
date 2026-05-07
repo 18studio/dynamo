@@ -152,3 +152,29 @@ async def test_abort_unknown_request_on_running_engine(started_engine):
     id the engine has never seen must not raise."""
     engine, _ = started_engine
     await engine.abort(cast(object, _FakeContext("never-submitted")))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "mode_arg, expected",
+    [
+        ("agg", "AGGREGATED"),
+        ("prefill", "PREFILL"),
+        ("decode", "DECODE"),
+    ],
+)
+async def test_from_args_propagates_disaggregation_mode_to_worker_config(
+    mode_arg, expected
+):
+    """``--disaggregation-mode`` must flow from CLI through to the
+    ``WorkerConfig`` the unified Worker sees, and onto the engine instance
+    so ``generate()`` can branch on it. Without this hookup the prefill
+    role would silently degrade to aggregated."""
+    from dynamo.common.constants import DisaggregationMode
+    from dynamo.vllm.llm_engine import VllmLLMEngine
+
+    engine, worker_config = await VllmLLMEngine.from_args(
+        _BASE_ARGV + ["--disaggregation-mode", mode_arg]
+    )
+    expected_mode = getattr(DisaggregationMode, expected)
+    assert engine.disaggregation_mode is expected_mode
+    assert worker_config.disaggregation_mode is expected_mode

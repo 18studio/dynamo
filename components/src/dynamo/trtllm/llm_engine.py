@@ -9,21 +9,28 @@ and feature gap details.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
 import re
 import sys
 from collections.abc import AsyncGenerator
+from dataclasses import asdict
 from typing import Any
 
+from tensorrt_llm.llmapi import (
+    DisaggregatedParams as LlmDisaggregatedParams,
+)
 from tensorrt_llm.llmapi import KvCacheConfig, SchedulerConfig
+from tensorrt_llm.llmapi.disagg_utils import get_global_disagg_request_id
 from tensorrt_llm.llmapi.llm import SamplingParams
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from torch.cuda import device_count
 
 from dynamo._core import Context
+from dynamo.common.backend.disagg import require_prefill_result
 from dynamo.common.backend.engine import (
     EngineConfig,
     GenerateChunk,
@@ -31,12 +38,35 @@ from dynamo.common.backend.engine import (
     LLMEngine,
 )
 from dynamo.common.backend.worker import WorkerConfig
+from dynamo.common.constants import DisaggregationMode as CommonDisaggregationMode
 from dynamo.llm import ModelInput
 from dynamo.trtllm.args import parse_args
+from dynamo.trtllm.constants import DisaggregationMode
 from dynamo.trtllm.engine import Backend, TensorRTLLMEngine
+from dynamo.trtllm.utils.disagg_utils import (
+    DisaggregatedParams,
+    DisaggregatedParamsCodec,
+)
 from dynamo.trtllm.utils.trtllm_utils import deep_update, warn_override_collisions
 
 logger = logging.getLogger(__name__)
+
+# Match the legacy non-unified path in `trtllm/main.py` so prefill drain
+# behavior is consistent across both entry points.
+_DRAIN_TIMEOUT_S = 30.0
+_DRAIN_POLL_INTERVAL_S = 0.5
+
+# `dynamo.trtllm.constants.DisaggregationMode` predates the unified
+# abstraction and uses different string values from
+# `dynamo.common.constants.DisaggregationMode` ("prefill_and_decode" vs.
+# "agg"). Map by name so the unified WorkerConfig sees a value it
+# recognises.
+_TRTLLM_TO_COMMON_DISAGG = {
+    DisaggregationMode.AGGREGATED: CommonDisaggregationMode.AGGREGATED,
+    DisaggregationMode.PREFILL: CommonDisaggregationMode.PREFILL,
+    DisaggregationMode.DECODE: CommonDisaggregationMode.DECODE,
+    DisaggregationMode.ENCODE: CommonDisaggregationMode.ENCODE,
+}
 
 
 class TrtllmLLMEngine(LLMEngine):
@@ -49,6 +79,7 @@ class TrtllmLLMEngine(LLMEngine):
         max_batch_size: int | None = None,
         max_num_tokens: int | None = None,
         kv_block_size: int = 32,
+        disaggregation_mode: DisaggregationMode = DisaggregationMode.AGGREGATED,
     ):
         self.engine_args = engine_args
         self.model_name = model_name
@@ -57,9 +88,18 @@ class TrtllmLLMEngine(LLMEngine):
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         self.kv_block_size = kv_block_size
+        # Disaggregation role; consulted in `generate()` to switch between
+        # context_only / generation_only / context_and_generation handling
+        # of TRT-LLM's `LlmDisaggregatedParams`.
+        self.disaggregation_mode = disaggregation_mode
         self._engine: TensorRTLLMEngine | None = None
         self._default_sampling_params = SamplingParams(detokenize=False)
         self._active_requests: dict[str, Any] = {}
+        # 10-bit machine_id for the TRT-LLM snowflake disagg_request_id.
+        # 0 is fine for the unified path because each worker process owns
+        # one engine — id collisions only matter when multiple engines
+        # share the same machine_id within a single distributed runtime.
+        self._disagg_machine_id = 0
 
     @classmethod
     async def from_args(
@@ -123,17 +163,19 @@ class TrtllmLLMEngine(LLMEngine):
             max_batch_size=engine_args.get("max_batch_size", config.max_batch_size),
             max_num_tokens=engine_args.get("max_num_tokens", config.max_num_tokens),
             kv_block_size=config.kv_block_size,
+            disaggregation_mode=config.disaggregation_mode,
         )
         worker_config = WorkerConfig.from_runtime_config(
             config,
             model_name=config.model,
             served_model_name=config.served_model_name,
             model_input=ModelInput.Tokens,
+            disaggregation_mode=_TRTLLM_TO_COMMON_DISAGG[config.disaggregation_mode],
         )
         return engine, worker_config
 
     async def start(self) -> EngineConfig:
-        self._engine = TensorRTLLMEngine(self.engine_args)
+        self._engine = TensorRTLLMEngine(self.engine_args, self.disaggregation_mode)
         await self._engine.initialize()
 
         return EngineConfig(
@@ -155,21 +197,55 @@ class TrtllmLLMEngine(LLMEngine):
             self._default_sampling_params, request
         )
 
+        # Disagg dispatch — TRT-LLM uses an explicit `LlmDisaggregatedParams`
+        # struct on every generate call. Prefill builds a context_only
+        # struct, packs the resulting handle into the response terminal.
+        # Decode pulls the prefill peer's handle off `prefill_result` and
+        # flips `request_type` to generation_only so TRT-LLM skips the
+        # context phase and resumes from the imported KV cache.
+        disaggregated_params: LlmDisaggregatedParams | None = None
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
+
+        if is_prefill:
+            disaggregated_params = LlmDisaggregatedParams(
+                request_type="context_only",
+                disagg_request_id=get_global_disagg_request_id(
+                    self._disagg_machine_id
+                ),
+            )
+        elif is_decode:
+            prefill_result = require_prefill_result(
+                request, _TRTLLM_TO_COMMON_DISAGG[self.disaggregation_mode]
+            )
+            disaggregated_params = self._decode_prefill_handoff(prefill_result)
+
         stop_conditions = request.get("stop_conditions", {})
-        max_tokens = stop_conditions.get("max_tokens")
-        if max_tokens is not None:
-            sampling_params.max_tokens = max_tokens
-        elif self.max_seq_len is not None:
-            sampling_params.max_tokens = max(1, self.max_seq_len - len(token_ids))
+        if is_prefill:
+            # Prefill workers only need the KV cache populated for the
+            # prompt; one token is enough. Override regardless of what
+            # the client asked for.
+            sampling_params.max_tokens = 1
+        else:
+            max_tokens = stop_conditions.get("max_tokens")
+            if max_tokens is not None:
+                sampling_params.max_tokens = max_tokens
+            elif self.max_seq_len is not None:
+                sampling_params.max_tokens = max(1, self.max_seq_len - len(token_ids))
 
         ignore_eos = stop_conditions.get("ignore_eos")
         if ignore_eos:
             sampling_params.ignore_eos = ignore_eos
 
+        # Prefill returns a single non-streaming response carrying the KV
+        # transfer handle; switching off streaming here matches the
+        # legacy TRT-LLM disagg path and keeps the wire-format symmetric.
+        streaming = not is_prefill
         generation_result = self._engine.llm.generate_async(
             inputs=token_ids,
             sampling_params=sampling_params,
-            streaming=True,
+            streaming=streaming,
+            disaggregated_params=disaggregated_params,
         )
 
         request_id = context.id()
@@ -214,6 +290,16 @@ class TrtllmLLMEngine(LLMEngine):
                             "completion_tokens": total_completion_tokens,
                             "total_tokens": prompt_tokens + total_completion_tokens,
                         }
+                        # Prefill terminal carries the encoded handoff
+                        # payload so the frontend's PrefillRouter can
+                        # forward it to the decode peer (matches the
+                        # legacy PrefillHandler wire format).
+                        if is_prefill:
+                            params_dict = self._encode_prefill_handoff(
+                                output, disaggregated_params
+                            )
+                            if params_dict is not None:
+                                out["disaggregated_params"] = params_dict  # type: ignore[typeddict-unknown-key]
 
                     # Yield the chunk to the client and update the token count
                     # for this output choice.
@@ -223,6 +309,58 @@ class TrtllmLLMEngine(LLMEngine):
             if request_id is not None:
                 self._active_requests.pop(request_id, None)
 
+    @staticmethod
+    def _decode_prefill_handoff(prefill_result: dict[str, Any]) -> LlmDisaggregatedParams:
+        """Decode the prefill peer's handoff payload into a TRT-LLM
+        `LlmDisaggregatedParams` ready to drive a generation_only call.
+        Mirrors `HandlerBase._decode_disaggregated_params_from_prefill`.
+        """
+        params_dict = dict(prefill_result.get("disaggregated_params") or {})
+        if not params_dict:
+            raise ValueError(
+                "decode worker received prefill_result without "
+                "disaggregated_params; the prefill peer must populate "
+                "this for TRT-LLM's KV transfer to import the cache"
+            )
+        # The prefill encoder may add a worker_id for routing — drop it
+        # before constructing the codec dataclass.
+        params_dict.pop("worker_id", None)
+        DisaggregatedParamsCodec.deserialize_first_gen_log_probs(params_dict)
+        params_dict.pop("_epd_metadata", None)
+        decoded = DisaggregatedParamsCodec.decode(DisaggregatedParams(**params_dict))
+        decoded.request_type = "generation_only"
+        # Multimodal embedding handles are already baked into the imported
+        # KV cache; clearing them avoids a TRT-LLM validation error in
+        # generation_only mode.
+        if (
+            hasattr(decoded, "multimodal_embedding_handles")
+            and decoded.multimodal_embedding_handles
+        ):
+            decoded.multimodal_embedding_handles = None
+        return decoded
+
+    @staticmethod
+    def _encode_prefill_handoff(
+        output: Any, input_params: LlmDisaggregatedParams | None
+    ) -> dict[str, Any] | None:
+        """Pack the engine's output `disaggregated_params` for transport.
+        Falls back to the input params if the engine didn't override them
+        (TRT-LLM occasionally returns None from a successful prefill)."""
+        params_to_encode = (
+            output.disaggregated_params
+            if output.disaggregated_params is not None
+            else input_params
+        )
+        encoded = DisaggregatedParamsCodec.encode(params_to_encode)
+        if encoded is None:
+            logger.error(
+                "PREFILL: encoded disaggregated_params is None; the decode peer will fail"
+            )
+            return None
+        params_dict = asdict(encoded)
+        DisaggregatedParamsCodec.serialize_first_gen_log_probs(params_dict)
+        return params_dict
+
     async def abort(self, context: Context) -> None:
         request_id = context.id()
         if request_id is not None:
@@ -230,6 +368,50 @@ class TrtllmLLMEngine(LLMEngine):
             if generation_result is not None:
                 generation_result.abort()
                 logger.debug("Aborted request %s", request_id)
+
+    async def drain(self) -> None:
+        """Wait for in-flight requests to finish before cleanup.
+
+        Only meaningful on prefill workers: their NIXL transfers may still
+        be reading GPU memory when a decode peer is in the middle of a
+        request, and freeing that memory under an active transfer
+        crashes the decode worker (issue #7319). Mirrors the legacy
+        `_make_drain_callback` polling behaviour from `trtllm/main.py`.
+        """
+        if (
+            self._engine is None
+            or self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            return
+
+        deadline = asyncio.get_running_loop().time() + _DRAIN_TIMEOUT_S
+        logger.info(
+            "Draining in-flight requests on prefill worker (timeout=%.1fs)",
+            _DRAIN_TIMEOUT_S,
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                stats_iter = self._engine.llm.get_stats_async(timeout=2)
+                stat = await anext(stats_iter)
+                active = stat.get("numActiveRequests", 0)
+                queued = stat.get("numQueuedRequests", 0)
+                if active + queued == 0:
+                    logger.info("All in-flight requests drained")
+                    return
+                logger.info(
+                    "Waiting for %d in-flight request(s) (active=%d, queued=%d)",
+                    active + queued,
+                    active,
+                    queued,
+                )
+            except Exception as e:
+                logger.debug("Stats poll failed during drain: %s", e)
+            await asyncio.sleep(_DRAIN_POLL_INTERVAL_S)
+        logger.warning(
+            "Drain timeout (%.1fs) reached; proceeding with shutdown — "
+            "some NIXL transfers may still be in flight",
+            _DRAIN_TIMEOUT_S,
+        )
 
     async def cleanup(self) -> None:
         if self._engine is not None:

@@ -24,12 +24,46 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from dynamo._core import backend as _backend
+from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import ModelInput
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from .engine import LLMEngine
 
 logger = logging.getLogger(__name__)
+
+# Map the user-facing `dynamo.common.constants.DisaggregationMode` (which
+# carries 4 modes including ENCODE) to the 3-mode Rust enum. ENCODE is not
+# supported by the unified abstraction yet — multimodal encode workers stay
+# on the legacy main.py path until they migrate.
+_DISAGG_MODE_TO_RUST = {
+    DisaggregationMode.AGGREGATED: _backend.DisaggregationMode.Aggregated,
+    DisaggregationMode.PREFILL: _backend.DisaggregationMode.Prefill,
+    DisaggregationMode.DECODE: _backend.DisaggregationMode.Decode,
+}
+
+
+def _to_rust_disaggregation_mode(mode: DisaggregationMode):
+    try:
+        return _DISAGG_MODE_TO_RUST[mode]
+    except KeyError as e:
+        raise NotImplementedError(
+            f"DisaggregationMode.{mode.name} is not supported by the unified "
+            "backend abstraction; use the legacy backend entry point for this "
+            "worker role"
+        ) from e
+
+
+def _coerce_disagg_mode(value) -> DisaggregationMode:
+    """Defensively map a runtime-config field to the unified
+    `DisaggregationMode`. Any value that isn't an instance of the
+    expected enum (e.g. trtllm's locally-defined enum, an unset `None`)
+    falls back to `AGGREGATED` — the engine's `from_args` is expected to
+    pass an explicit `disaggregation_mode=` override via `**overrides`
+    when its native type doesn't match."""
+    if isinstance(value, DisaggregationMode):
+        return value
+    return DisaggregationMode.AGGREGATED
 
 
 @dataclass
@@ -51,6 +85,11 @@ class WorkerConfig:
     exclude_tools_when_tool_choice_none: bool = True
     enable_local_indexer: bool = True
     metrics_labels: list[tuple[str, str]] = field(default_factory=list)
+    # Disaggregation role; default AGGREGATED keeps existing callers unchanged.
+    # The Rust Worker reads this for registration (Prefill→ModelType::Prefill,
+    # Decode→disable local indexer); engines read it from their own runtime
+    # config to switch per-mode protocol behavior in `generate()`.
+    disaggregation_mode: DisaggregationMode = DisaggregationMode.AGGREGATED
 
     @classmethod
     def from_runtime_config(
@@ -88,6 +127,25 @@ class WorkerConfig:
                 runtime_cfg, "exclude_tools_when_tool_choice_none", True
             ),
             "enable_local_indexer": getattr(runtime_cfg, "enable_local_indexer", True),
+            # Backends carry the resolved DisaggregationMode under different
+            # field names — vLLM/TRT-LLM use `disaggregation_mode`, SGLang
+            # uses `serving_mode`. Probe both before falling back to AGGREGATED.
+            #
+            # Type-check the value: TRT-LLM defines its OWN
+            # `DisaggregationMode` enum (`dynamo.trtllm.constants`) with
+            # different string values from the unified `DisaggregationMode`
+            # used here. If we let a foreign enum through, the dataclass
+            # silently stores a wrong-typed value and downstream
+            # `_to_rust_disaggregation_mode` errors with KeyError. Reject
+            # at the boundary; trtllm's `from_args` passes an explicit
+            # override via `**overrides` so this fallback never bites it.
+            "disaggregation_mode": _coerce_disagg_mode(
+                getattr(
+                    runtime_cfg,
+                    "disaggregation_mode",
+                    getattr(runtime_cfg, "serving_mode", None),
+                )
+            ),
         }
         if model_input is not None:
             kwargs["model_input"] = model_input
@@ -139,6 +197,9 @@ class Worker:
             ),
             enable_local_indexer=self.config.enable_local_indexer,
             metrics_labels=list(self.config.metrics_labels),
+            disaggregation_mode=_to_rust_disaggregation_mode(
+                self.config.disaggregation_mode
+            ),
             runtime=runtime_cfg,
         )
 

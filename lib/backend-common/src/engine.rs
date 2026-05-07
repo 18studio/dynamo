@@ -18,7 +18,7 @@ use futures::stream::BoxStream;
 use crate::error::DynamoError;
 
 pub use dynamo_llm::protocols::common::llm_backend::LLMEngineOutput;
-pub use dynamo_llm::protocols::common::preprocessor::PreprocessedRequest;
+pub use dynamo_llm::protocols::common::preprocessor::{BootstrapInfo, PrefillResult, PreprocessedRequest};
 pub use dynamo_llm::protocols::common::{
     FinishReason, OutputOptions, SamplingOptions, StopConditions,
 };
@@ -52,6 +52,17 @@ pub struct EngineConfig {
     pub max_num_seqs: Option<u64>,
     /// Maximum tokens the engine will process in a single batched step.
     pub max_num_batched_tokens: Option<u64>,
+    /// Bootstrap host this prefill worker advertises to decode peers.
+    /// Only meaningful when `disaggregation_mode == Prefill`. Set this
+    /// in `start()` after the engine has resolved its bootstrap address
+    /// (SGLang reads `tokenizer_manager.server_args.disaggregation_bootstrap_port`,
+    /// for example). When both this and `bootstrap_port` are populated,
+    /// `Worker` publishes them via `ModelRuntimeConfig::set_disaggregated_endpoint`
+    /// so the frontend's `PrefillRouter` can take its optimised
+    /// "Bootstrap path" (route decode concurrent with prefill).
+    pub bootstrap_host: Option<String>,
+    /// Bootstrap port for disaggregated KV transfer. See `bootstrap_host`.
+    pub bootstrap_port: Option<u16>,
 }
 
 /// Inference engine trait.

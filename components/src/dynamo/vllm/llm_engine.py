@@ -19,6 +19,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from dynamo._core import Context
+from dynamo.common.backend.disagg import require_prefill_result
 from dynamo.common.backend.engine import (
     EngineConfig,
     GenerateChunk,
@@ -26,6 +27,7 @@ from dynamo.common.backend.engine import (
     LLMEngine,
 )
 from dynamo.common.backend.worker import WorkerConfig
+from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import ModelInput
 from dynamo.vllm.args import parse_args
 
@@ -35,8 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 class VllmLLMEngine(LLMEngine):
-    def __init__(self, engine_args):
+    def __init__(self, engine_args, disaggregation_mode: DisaggregationMode):
         self.engine_args = engine_args
+        self.disaggregation_mode = disaggregation_mode
         self.engine_client = None
         self._vllm_config = None
         self._default_sampling_params = None
@@ -54,7 +57,7 @@ class VllmLLMEngine(LLMEngine):
                 config.engine_args.served_model_name
             ) = config.model
 
-        engine = cls(config.engine_args)
+        engine = cls(config.engine_args, config.disaggregation_mode)
         worker_config = WorkerConfig.from_runtime_config(
             config,
             model_name=config.model,
@@ -120,8 +123,56 @@ class VllmLLMEngine(LLMEngine):
             dict(request), self._default_sampling_params, self._model_max_len
         )
 
+        # vLLM's KV transfer happens transparently inside the engine via the
+        # NixlConnector (configured via --kv-transfer-config). The Dynamo
+        # layer only needs to:
+        #   - PREFILL: tag sampling_params with `do_remote_decode` so the
+        #     connector pushes its KV blocks instead of decoding locally,
+        #     cap output to one token, and pack the connector's
+        #     kv_transfer_params into the response so the frontend's
+        #     PrefillRouter can forward them to the decode peer.
+        #   - DECODE: pull `kv_transfer_params` from the prefill peer's
+        #     response (carried on `prefill_result`) and pass them through
+        #     so the connector pulls KV blocks from the prefill side.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            # Direct assignment (vs. legacy `setdefault`) is safe today
+            # because `build_sampling_params` does not populate
+            # `extra_args["kv_transfer_params"]`. If a future change
+            # starts threading this key through that helper, switch to
+            # `setdefault` so the prefill role doesn't clobber values
+            # the caller already set.
+            sampling_params.extra_args["kv_transfer_params"] = {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+                "remote_engine_id": None,
+                "remote_block_ids": None,
+                "remote_host": None,
+                "remote_port": None,
+            }
+            sampling_params.max_tokens = 1
+            sampling_params.min_tokens = 1
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            prefill_result = require_prefill_result(
+                request, self.disaggregation_mode
+            )
+            kv_params = prefill_result.get("disaggregated_params", {}).get(
+                "kv_transfer_params"
+            )
+            if kv_params is None:
+                raise ValueError(
+                    "decode worker received prefill_result without "
+                    "kv_transfer_params; the prefill peer must populate "
+                    "this for vLLM's NixlConnector to pull KV blocks"
+                )
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args["kv_transfer_params"] = kv_params
+
         gen = self.engine_client.generate(prompt, sampling_params, request_id)
 
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
         num_output_tokens_so_far: dict[int, int] = {}
         async for res in gen:
             if not res.outputs:
@@ -154,6 +205,18 @@ class VllmLLMEngine(LLMEngine):
                         "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens,
                     }
+                    # Prefill terminal carries the connector's transfer
+                    # handle so the decode peer can pull the right KV
+                    # blocks. The frontend's PrefillRouter forwards this
+                    # under `prefill_result.disaggregated_params`.
+                    if is_prefill:
+                        kv_transfer_params = getattr(
+                            res, "kv_transfer_params", None
+                        )
+                        if kv_transfer_params is not None:
+                            out["disaggregated_params"] = {  # type: ignore[typeddict-unknown-key]
+                                "kv_transfer_params": kv_transfer_params,
+                            }
 
                 yield out
                 num_output_tokens_so_far[output_idx] = next_total

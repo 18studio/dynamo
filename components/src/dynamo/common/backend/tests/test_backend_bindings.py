@@ -108,6 +108,17 @@ def test_worker_config_accepts_parser_runtime_settings():
     )
 
 
+def test_worker_config_accepts_disaggregation_mode():
+    """The Rust binding must accept a DisaggregationMode kwarg so the
+    Python shim can plumb the field through. Each variant must construct."""
+    for mode in (
+        backend.DisaggregationMode.Aggregated,
+        backend.DisaggregationMode.Prefill,
+        backend.DisaggregationMode.Decode,
+    ):
+        backend.WorkerConfig(namespace="dynamo", disaggregation_mode=mode)
+
+
 @pytest.mark.unified
 def test_python_worker_config_from_runtime_config_copies_parser_settings():
     from dynamo.common.backend.worker import WorkerConfig
@@ -170,6 +181,112 @@ def test_python_worker_config_from_runtime_config_overrides_win():
     )
 
     assert cfg.component == "from-override"
+
+
+@pytest.mark.unified
+def test_python_worker_config_picks_up_disaggregation_mode_from_runtime_config():
+    from dynamo.common.backend.worker import WorkerConfig
+    from dynamo.common.constants import DisaggregationMode
+
+    class _Prefill:
+        namespace = "ns"
+        discovery_backend = "etcd"
+        request_plane = "tcp"
+        event_plane = "nats"
+        # vLLM/TRT-LLM use this name; the helper's primary lookup path.
+        disaggregation_mode = DisaggregationMode.PREFILL
+
+    cfg = WorkerConfig.from_runtime_config(_Prefill(), model_name="m")
+    assert cfg.disaggregation_mode is DisaggregationMode.PREFILL
+
+
+@pytest.mark.unified
+def test_python_worker_config_falls_back_to_serving_mode_for_sglang():
+    from dynamo.common.backend.worker import WorkerConfig
+    from dynamo.common.constants import DisaggregationMode
+
+    class _Sglang:
+        # SGLang stores the resolved mode under `serving_mode` rather than
+        # `disaggregation_mode`. The from_runtime_config helper must probe
+        # both names so both backends round-trip without per-backend wiring.
+        namespace = "ns"
+        discovery_backend = "etcd"
+        request_plane = "tcp"
+        event_plane = "nats"
+        serving_mode = DisaggregationMode.DECODE
+
+    cfg = WorkerConfig.from_runtime_config(_Sglang(), model_name="m")
+    assert cfg.disaggregation_mode is DisaggregationMode.DECODE
+
+
+@pytest.mark.unified
+def test_python_worker_config_defaults_to_aggregated_when_runtime_lacks_mode():
+    from dynamo.common.backend.worker import WorkerConfig
+    from dynamo.common.constants import DisaggregationMode
+
+    class _NoMode:
+        namespace = "ns"
+        discovery_backend = "etcd"
+        request_plane = "tcp"
+        event_plane = "nats"
+
+    cfg = WorkerConfig.from_runtime_config(_NoMode(), model_name="m")
+    assert cfg.disaggregation_mode is DisaggregationMode.AGGREGATED
+
+
+@pytest.mark.unified
+def test_python_worker_config_rejects_foreign_disaggregation_mode_enum():
+    """Trtllm has its own DisaggregationMode enum with different string
+    values. ``from_runtime_config`` must NOT silently accept it — type
+    mismatches in the dataclass would crash deeper in the stack with
+    confusing KeyErrors when the Rust binding tries to translate the
+    mode. Engines whose native enum doesn't match are expected to pass
+    an explicit override via ``**overrides``."""
+    import enum
+
+    from dynamo.common.backend.worker import WorkerConfig
+    from dynamo.common.constants import DisaggregationMode
+
+    class _ForeignMode(enum.Enum):
+        AGGREGATED = "prefill_and_decode"
+        PREFILL = "prefill"
+
+    class _RuntimeWithForeignMode:
+        namespace = "ns"
+        discovery_backend = "etcd"
+        request_plane = "tcp"
+        event_plane = "nats"
+        disaggregation_mode = _ForeignMode.PREFILL
+
+    # Without override: foreign enum is rejected, fallback to AGGREGATED.
+    cfg = WorkerConfig.from_runtime_config(_RuntimeWithForeignMode(), model_name="m")
+    assert cfg.disaggregation_mode is DisaggregationMode.AGGREGATED
+
+    # With override: caller-supplied value wins (this is the trtllm path).
+    cfg = WorkerConfig.from_runtime_config(
+        _RuntimeWithForeignMode(),
+        model_name="m",
+        disaggregation_mode=DisaggregationMode.PREFILL,
+    )
+    assert cfg.disaggregation_mode is DisaggregationMode.PREFILL
+
+
+@pytest.mark.unified
+def test_python_worker_config_rejects_unsupported_mode_when_running():
+    """ENCODE has no unified-path implementation yet; the shim must raise
+    NotImplementedError when it tries to translate the mode for the Rust
+    binding instead of silently treating ENCODE as aggregated."""
+    from dynamo.common.backend.worker import (
+        WorkerConfig,
+        _to_rust_disaggregation_mode,
+    )
+    from dynamo.common.constants import DisaggregationMode
+
+    cfg = WorkerConfig(
+        namespace="ns", disaggregation_mode=DisaggregationMode.ENCODE
+    )
+    with pytest.raises(NotImplementedError):
+        _to_rust_disaggregation_mode(cfg.disaggregation_mode)
 
 
 def test_worker_constructor_requires_engine_config_loop():
