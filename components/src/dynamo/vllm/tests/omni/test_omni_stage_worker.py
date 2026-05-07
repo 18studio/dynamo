@@ -373,7 +373,9 @@ async def test_connector_uses_multimodal_chunk_for_stage_handoff():
         engine=engine,
         connectors={("0", "1"): out_connector},
         stage_id=0,
+        stage_config=_make_stage_config(final_output=True, final_output_type="text"),
     )
+    worker._output_modalities = ["text"]
     request = {
         "request_id": "req-text-audio",
         "messages": [{"role": "user", "content": "hello"}],
